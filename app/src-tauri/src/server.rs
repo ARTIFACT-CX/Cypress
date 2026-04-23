@@ -81,7 +81,7 @@ impl ServerState {
 }
 
 // STEP: resolve the absolute path of the Go server directory at compile time.
-// CARGO_MANIFEST_DIR points at `tauri-app/src-tauri`; the server sits at
+// CARGO_MANIFEST_DIR points at `app/src-tauri`; the server sits at
 // `../../server` relative to that. Resolving once at build time means the
 // dev-mode path can't drift based on where the binary is launched from.
 fn server_dir() -> PathBuf {
