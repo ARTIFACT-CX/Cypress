@@ -41,6 +41,25 @@ type Manager struct {
 	state  State
 	worker *worker
 	model  string
+	device string // populated on successful load; "mps" / "cuda" / "cpu"
+	phase  string // current loader phase ("downloading_mimi", etc.), cleared on ready
+	// lastError stores the most recent load failure so the UI can surface it
+	// even when it polled in after the failing HTTP request already returned.
+	// Cleared when a new load starts so stale errors don't linger.
+	lastError string
+}
+
+// Snapshot is the Manager's external view — what the HTTP /status endpoint
+// returns. Grouped here so callers don't accidentally read half-updated
+// fields without the lock.
+type Snapshot struct {
+	State  State  `json:"state"`
+	Model  string `json:"model"`
+	Device string `json:"device"`
+	Phase  string `json:"phase"`
+	// Error is the last load failure, if any. Present so the UI can show
+	// the error even if its triggering HTTP request already timed out.
+	Error string `json:"error,omitempty"`
 }
 
 // NewManager builds a Manager in the idle state. Starting the worker is
@@ -64,6 +83,9 @@ func (m *Manager) LoadModel(ctx context.Context, name string) error {
 		m.mu.Unlock()
 		return errors.New("busy: another load in progress")
 	}
+	// Clear any stale error from a previous failed attempt so the UI
+	// doesn't continue to show it once the user retries.
+	m.lastError = ""
 
 	if m.worker == nil {
 		m.state = StateStarting
@@ -79,6 +101,11 @@ func (m *Manager) LoadModel(ctx context.Context, name string) error {
 			m.mu.Unlock()
 			return err
 		}
+		// STEP 2a: wire the event handler. The worker emits phase
+		// updates during load (downloading_mimi, loading_tokenizer,
+		// etc.); we stash the latest one so the /status endpoint can
+		// return it for the UI to display.
+		w.onEvent = m.handleEvent
 		m.worker = w
 	}
 
@@ -88,35 +115,63 @@ func (m *Manager) LoadModel(ctx context.Context, name string) error {
 
 	// STEP 3: ask the worker to load the model. The "name" field matches
 	// the worker's ipc_commands.load_model handler.
-	_, err := w.send(ctx, "load_model", map[string]any{"name": name})
+	reply, err := w.send(ctx, "load_model", map[string]any{"name": name})
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
+	// Always clear phase once load_model returns — the transitional
+	// "downloading_*" strings are meaningful only during the blocking call.
+	m.phase = ""
+
 	if err != nil {
 		// WHY: on loader failure we stay in Ready, not Idle — the worker
 		// is still up and happy to try a different model. Killing it on
 		// every failed load would make recovery needlessly expensive.
 		m.state = StateReady
+		m.lastError = err.Error()
 		return err
 	}
 	m.model = name
+	if dev, ok := reply["device"].(string); ok {
+		m.device = dev
+	}
 	m.state = StateServing
 	return nil
 }
 
-// Status returns the current lifecycle state. Cheap and lock-protected so
-// the HTTP /status endpoint can poll it freely.
-func (m *Manager) Status() State {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	return m.state
+// handleEvent is the worker.onEvent callback. Fires for every unsolicited
+// worker→host message; today that's just phase updates from model loaders.
+// Keep this fast — it runs on the worker's read-loop goroutine.
+func (m *Manager) handleEvent(msg map[string]any) {
+	event, _ := msg["event"].(string)
+	switch event {
+	case "model_phase":
+		phase, _ := msg["phase"].(string)
+		m.mu.Lock()
+		m.phase = phase
+		// The "resolving" phase includes the device up front so the UI
+		// can start showing "Loading on MPS…" before any weights have
+		// actually landed there.
+		if dev, ok := msg["device"].(string); ok {
+			m.device = dev
+		}
+		m.mu.Unlock()
+	}
 }
 
-// Model returns the name of the currently loaded model, or "" if none.
-func (m *Manager) Model() string {
+// Status returns a point-in-time snapshot of the inference subsystem.
+// Grouped into one struct (rather than separate accessors per field) so
+// callers can't interleave reads and see inconsistent combinations.
+func (m *Manager) Status() Snapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.model
+	return Snapshot{
+		State:  m.state,
+		Model:  m.model,
+		Device: m.device,
+		Phase:  m.phase,
+		Error:  m.lastError,
+	}
 }
 
 // Shutdown terminates the worker subprocess if one is running. Safe to call
@@ -126,6 +181,8 @@ func (m *Manager) Shutdown(ctx context.Context) {
 	w := m.worker
 	m.worker = nil
 	m.model = ""
+	m.device = ""
+	m.phase = ""
 	m.state = StateIdle
 	m.mu.Unlock()
 

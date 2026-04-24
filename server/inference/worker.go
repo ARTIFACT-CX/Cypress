@@ -57,6 +57,11 @@ type worker struct {
 	mu      sync.Mutex
 	waiters map[uint64]chan reply
 
+	// onEvent handles unsolicited worker→host messages (lines with an
+	// "event" field but no "id"). Phase updates during model load flow
+	// through here. Set by the Manager after spawn.
+	onEvent func(map[string]any)
+
 	// done closes when the read loop exits (worker stdout hit EOF). Used to
 	// unblock Send callers with a clear error instead of hanging forever.
 	done chan struct{}
@@ -193,7 +198,15 @@ func (w *worker) readLoop(scanner *bufio.Scanner) {
 		// concept of "number that was an integer". We cast on the way out.
 		idF, ok := msg["id"].(float64)
 		if !ok {
-			log.Printf("worker: unsolicited: %v", msg)
+			// No id = unsolicited event from the worker (phase updates
+			// during model load, future telemetry, etc.). Route them to
+			// the Manager's handler if one is set; otherwise log so we
+			// don't silently drop useful signal.
+			if _, isEvent := msg["event"]; isEvent && w.onEvent != nil {
+				w.onEvent(msg)
+			} else {
+				log.Printf("worker: unsolicited: %v", msg)
+			}
 			continue
 		}
 		id := uint64(idF)

@@ -25,39 +25,97 @@ import json
 import sys
 from typing import Any, Awaitable, Callable
 
-# SETUP: shared worker state. Currently trivial — just tracks whether a
-# model is loaded. Will grow once models actually load.
+import models  # noqa: F401 — import to populate models.REGISTRY via side-effect
+from models import REGISTRY
+
+# SETUP: shared worker state. The model instance is kept so load_model
+# can cleanly unload the previous one before swapping. device is surfaced
+# to /status so the UI can show "Running on MPS" etc.
 _state: dict[str, Any] = {
     "model": None,  # Name of the currently loaded model, or None.
+    "instance": None,  # Live Model subclass instance, or None.
+    "device": None,  # Device string ("mps", "cuda", "cpu") or None.
 }
+
+# SETUP: the write function passed in by run_loop gets stashed here so
+# event emits from nested code (model loaders, etc.) can reach stdout
+# without every layer having to pass the callback down.
+_write_fn: "WriteFn | None" = None
 
 
 Handler = Callable[[dict], Awaitable[dict]]
 WriteFn = Callable[[dict], None]
 
 
+def _emit_event(msg: dict) -> None:
+    # Events are worker→host one-way messages with no id. The host
+    # readLoop routes them into a Manager event handler rather than any
+    # waiter channel. Keeping them out-of-band means they never collide
+    # with pending request/reply pairs.
+    if _write_fn is not None:
+        _write_fn(msg)
+
+
 async def _handle_status(_msg: dict) -> dict:
     # Mirror of what the host's UI needs to show: are we idle, or do we
-    # have a model loaded?
-    return {"ok": True, "model": _state["model"]}
+    # have a model loaded, and on what device?
+    return {
+        "ok": True,
+        "model": _state["model"],
+        "device": _state["device"],
+    }
 
 
 async def _handle_load_model(msg: dict) -> dict:
-    # STEP: parse and validate the target model name.
+    # STEP 1: validate the target name.
     name = msg.get("name")
     if not isinstance(name, str) or not name:
         return {"error": "missing or invalid 'name'"}
 
-    # TODO: look up the model in models.REGISTRY, instantiate, call load().
-    # For the scaffold we just record intent and return not-implemented so
-    # the host + UI wiring can be tested end-to-end before any real weights
-    # get loaded.
-    return {"error": f"model '{name}' loader not yet implemented"}
+    cls = REGISTRY.get(name)
+    if cls is None:
+        known = ", ".join(sorted(REGISTRY.keys())) or "(none registered)"
+        return {"error": f"unknown model {name!r}; known: {known}"}
+
+    # STEP 2: unload any previously loaded model so we don't double up
+    # on VRAM. Swallow errors from the old one — we're throwing it away
+    # anyway, and a failed unload shouldn't block a new load.
+    prev = _state["instance"]
+    if prev is not None:
+        try:
+            await prev.unload()
+        except Exception:
+            pass
+        _state["model"] = None
+        _state["instance"] = None
+        _state["device"] = None
+
+    # STEP 3: instantiate and load. The loader handles its own phase
+    # events via _emit_event so the host can relay them to the UI.
+    instance = cls(_emit_event)
+    try:
+        await instance.load()
+    except Exception as e:
+        # Include the repr — torch / HF errors often have type info in
+        # the class name that's lost by str(e) alone.
+        return {"error": f"{type(e).__name__}: {e}"}
+
+    _state["model"] = name
+    _state["instance"] = instance
+    _state["device"] = instance.device() if hasattr(instance, "device") else None
+    return {"ok": True, "model": name, "device": _state["device"]}
 
 
 async def _handle_unload(_msg: dict) -> dict:
-    # TODO: real unload once loaders exist.
+    prev = _state["instance"]
+    if prev is not None:
+        try:
+            await prev.unload()
+        except Exception as e:
+            return {"error": f"unload failed: {type(e).__name__}: {e}"}
     _state["model"] = None
+    _state["instance"] = None
+    _state["device"] = None
     return {"ok": True}
 
 
@@ -86,6 +144,12 @@ async def _stdin_reader() -> asyncio.StreamReader:
 
 
 async def run_loop(write: WriteFn) -> None:
+    # Stash the write fn for out-of-band event emits (model phase updates
+    # etc.). run_loop is the single entry point, so doing it once here
+    # covers every downstream caller.
+    global _write_fn
+    _write_fn = write
+
     reader = await _stdin_reader()
 
     while True:

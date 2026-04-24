@@ -29,7 +29,28 @@ type InferenceState = "idle" | "starting" | "ready" | "loading" | "serving";
 type Status = {
   state: InferenceState;
   model: string;
+  device: string;
+  // Phase is transitional — only populated while the worker is mid-load
+  // (downloading_mimi, downloading_lm, loading_tokenizer, etc.).
+  phase: string;
+  // Error is the last load failure, if any. Surfaced by the server so we
+  // catch failures that happened after the fire-and-forget POST returned.
+  error?: string;
 };
+
+// Human-readable mapping for phase strings emitted by the worker. Unknown
+// phases fall back to the raw string, so new worker-side phases show up
+// in the UI without requiring a frontend change.
+const PHASE_LABELS: Record<string, string> = {
+  resolving: "Resolving checkpoint…",
+  downloading_mimi: "Downloading audio codec…",
+  downloading_lm:
+    "Downloading language model… (first run only — can take several minutes)",
+  loading_tokenizer: "Loading text tokenizer…",
+  ready: "Finishing up…",
+};
+
+const EMPTY_STATUS: Status = { state: "idle", model: "", device: "", phase: "" };
 
 export function ModelPicker() {
   // STEP 1: track whether the Go server is up. The model buttons are
@@ -38,8 +59,8 @@ export function ModelPicker() {
   const [serverState, setServerState] = useState<ServerState>("idle");
 
   // STEP 2: track the inference subsystem's own state. Populated by polling
-  // /status after the server comes up, and after each load attempt.
-  const [status, setStatus] = useState<Status>({ state: "idle", model: "" });
+  // /status while a load is in flight, and once on server-ready.
+  const [status, setStatus] = useState<Status>(EMPTY_STATUS);
   const [pending, setPending] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
@@ -57,11 +78,18 @@ export function ModelPicker() {
     };
   }, []);
 
-  // STEP 4: refresh /status whenever the server comes online. One poll is
-  // enough — after that, every load action refreshes status locally from
-  // its own response, so we don't need continuous polling.
+  // STEP 4: refresh /status once when the server comes online so we pick
+  // up any model that was left loaded from a previous session. When the
+  // server leaves "running" we also wipe local status back to idle — the
+  // worker is gone, so any "Moshi active" badge would otherwise linger
+  // from stale React state.
   useEffect(() => {
-    if (serverState !== "running") return;
+    if (serverState !== "running") {
+      setStatus(EMPTY_STATUS);
+      setPending(null);
+      setError(null);
+      return;
+    }
     let cancelled = false;
     fetch(`${SERVER_URL}/status`)
       .then((r) => r.json())
@@ -74,46 +102,86 @@ export function ModelPicker() {
     };
   }, [serverState]);
 
+  // STEP 5: while a load is in flight, poll /status so the UI can show
+  // the worker's current phase (downloading mimi, downloading lm, etc.)
+  // instead of a silent spinner. The server's /model/load is fire-and-
+  // forget, so this poll is also how we learn that the load finished —
+  // when state transitions to "serving" (success) or "ready" with an
+  // error field (failure), we clear `pending` and surface accordingly.
+  useEffect(() => {
+    if (pending === null) return;
+    let cancelled = false;
+    const tick = () => {
+      fetch(`${SERVER_URL}/status`)
+        .then((r) => r.json())
+        .then((s: Status) => {
+          if (cancelled) return;
+          setStatus(s);
+          // Terminal states: stop tracking pending. Serving means load
+          // completed; ready-with-error means the worker rejected it.
+          // Idle shouldn't happen mid-load but treat it as terminal too
+          // in case the worker crashed out from under us.
+          if (s.state === "serving" || s.state === "idle") {
+            setPending(null);
+          } else if (s.state === "ready" && s.error) {
+            setError(s.error);
+            setPending(null);
+          }
+        })
+        .catch(() => {});
+    };
+    // Kick off immediately so the UI updates on the first phase event
+    // rather than waiting a full interval, then poll steadily. 500ms is
+    // fast enough to feel live without being wasteful for an all-local
+    // HTTP call.
+    tick();
+    const handle = setInterval(tick, 500);
+    return () => {
+      cancelled = true;
+      clearInterval(handle);
+    };
+  }, [pending]);
+
   const loadModel = useCallback(async (name: string) => {
     setPending(name);
     setError(null);
     try {
+      // WHY: /model/load is fire-and-forget. The server returns 202 as
+      // soon as the load goroutine is kicked off; completion (success
+      // or failure) is observed via the /status poll above. This lets
+      // multi-minute first-run downloads work reliably without being
+      // bounded by the browser's fetch timeout.
       const res = await fetch(`${SERVER_URL}/model/load`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ name }),
       });
-      const body = await res.json().catch(() => ({}));
       if (!res.ok) {
-        // WHY: surface the server's error verbatim. uv-not-found, handshake
-        // timeout, and worker-side "model not implemented" all flow through
-        // here, and each one is more useful raw than wrapped.
+        const body = await res.json().catch(() => ({}));
         throw new Error(body.error || `HTTP ${res.status}`);
       }
-      // Optimistic update. A subsequent /status poll would confirm, but
-      // the response already tells us everything we need.
-      setStatus({ state: "serving", model: name });
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
-      // Refresh status so we don't leave the UI showing a stale "loading".
-      fetch(`${SERVER_URL}/status`)
-        .then((r) => r.json())
-        .then((s: Status) => setStatus(s))
-        .catch(() => {});
-    } finally {
       setPending(null);
     }
   }, []);
 
   const serverUp = serverState === "running";
-  const busy = pending !== null || status.state === "loading" || status.state === "starting";
+  const busy =
+    pending !== null ||
+    status.state === "loading" ||
+    status.state === "starting";
+  const phaseLabel = status.phase
+    ? PHASE_LABELS[status.phase] ?? status.phase
+    : null;
 
   return (
     <div className="fixed bottom-4 left-4 flex max-w-xs flex-col gap-2 rounded-md border bg-card/80 p-3 text-xs backdrop-blur">
       <div className="font-medium text-foreground">Model</div>
       <div className="flex flex-col gap-1.5">
         {MODELS.map((m) => {
-          const isActive = status.model === m.name && status.state === "serving";
+          const isActive =
+            status.model === m.name && status.state === "serving";
           const isPending = pending === m.name;
           return (
             <button
@@ -127,10 +195,20 @@ export function ModelPicker() {
                   : "border-border bg-secondary text-secondary-foreground hover:bg-accent"
               }`}
             >
-              <span className="font-medium">
+              <span className="flex items-center gap-1.5 font-medium">
                 {m.label}
-                {isPending && " · loading…"}
-                {isActive && " · active"}
+                {isPending && (
+                  <span className="text-muted-foreground">· loading…</span>
+                )}
+                {isActive && (
+                  // Green dot indicates the model is live and serving. Kept
+                  // as a tiny visual cue instead of a text suffix so the row
+                  // stays compact at a glance.
+                  <span
+                    aria-label="active"
+                    className="h-1.5 w-1.5 rounded-full bg-green-500"
+                  />
+                )}
               </span>
               <span className="text-muted-foreground">{m.hint}</span>
             </button>
@@ -139,6 +217,9 @@ export function ModelPicker() {
       </div>
       {!serverUp && (
         <div className="text-muted-foreground">Start the server first.</div>
+      )}
+      {phaseLabel && (
+        <div className="text-muted-foreground italic">{phaseLabel}</div>
       )}
       {error && (
         <div className="rounded border border-red-500/30 bg-red-500/10 px-2 py-1 text-red-400">

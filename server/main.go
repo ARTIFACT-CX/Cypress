@@ -47,10 +47,9 @@ func main() {
 	// fetch() from localhost — no Rust bridge needed since the traffic is
 	// intra-machine and same-origin from Tauri's perspective.
 	mux.HandleFunc("/status", func(w http.ResponseWriter, _ *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{
-			"state": inferenceMgr.Status(),
-			"model": inferenceMgr.Model(),
-		})
+		// Snapshot carries {state, model, device, phase} in one atomic
+		// read — see inference.Manager.Status.
+		writeJSON(w, http.StatusOK, inferenceMgr.Status())
 	})
 	mux.HandleFunc("/model/load", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -68,20 +67,23 @@ func main() {
 			http.Error(w, "missing 'name'", http.StatusBadRequest)
 			return
 		}
-		// WHY: a dedicated context with a wide timeout — uv cold start plus
-		// (eventually) model weight load could legitimately take a minute.
-		// We still want an upper bound so a wedged loader can't pin the
-		// request forever.
-		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Minute)
-		defer cancel()
-		if err := inferenceMgr.LoadModel(ctx, body.Name); err != nil {
-			log.Printf("load_model %q failed: %v", body.Name, err)
-			writeJSON(w, http.StatusInternalServerError, map[string]any{
-				"error": err.Error(),
-			})
-			return
-		}
-		writeJSON(w, http.StatusOK, map[string]any{
+		// WHY: fire-and-forget. First-run model downloads can take many
+		// minutes, and the browser's fetch would time out long before the
+		// download finishes — leaving the UI thinking the load failed
+		// while the worker is still happily pulling weights. Instead we
+		// kick the load off in a background goroutine (with a generous
+		// upper bound so a wedged loader can't pin the worker forever)
+		// and let the UI drive completion from /status polling. The
+		// Snapshot carries state + phase + error, which is everything
+		// the UI needs to render the outcome.
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
+			defer cancel()
+			if err := inferenceMgr.LoadModel(ctx, body.Name); err != nil {
+				log.Printf("load_model %q failed: %v", body.Name, err)
+			}
+		}()
+		writeJSON(w, http.StatusAccepted, map[string]any{
 			"ok":    true,
 			"model": body.Name,
 		})
@@ -89,7 +91,7 @@ func main() {
 
 	srv := &http.Server{
 		Addr:              listenAddr,
-		Handler:           mux,
+		Handler:           withCORS(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -125,6 +127,24 @@ func main() {
 		log.Printf("http shutdown error: %v", err)
 	}
 	log.Println("bye")
+}
+
+// withCORS wraps the mux with permissive CORS headers. Safe because the
+// server binds to 127.0.0.1 only — no remote origin can reach us anyway,
+// but the browser still enforces same-origin on the Tauri UI's dev server
+// (http://localhost:1420). Without these headers fetch() from the UI fails
+// with an opaque "access control checks" error.
+func withCORS(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		if r.Method == http.MethodOptions {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 // writeJSON is a tiny helper so the HTTP handlers above aren't littered

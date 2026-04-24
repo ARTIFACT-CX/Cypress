@@ -8,4 +8,10 @@ name = "cypress-worker"
 version = "0.1.0"
 description = "Python inference worker for Cypress"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = [
+    # moshi ships its own torch pin; we let it drive the torch version so
+    # checkpoint format and op coverage stay aligned with what kyutai tests.
+    "moshi>=0.2.0",
+    # hf_hub_download is used directly for weight resolution / cache dirs.
+    "huggingface_hub>=0.24",
+]
