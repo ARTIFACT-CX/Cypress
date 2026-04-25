@@ -117,6 +117,16 @@ pub async fn start_server(app: AppHandle, state: State<'_, ServerState>) -> Resu
     }
     let _ = app.emit(STATUS_EVENT, ServerStatus::Starting);
 
+    // STEP 1a: defensive port cleanup. Hot reloads of `tauri dev`, an app
+    // crash, or a Cargo rebuild that SIGKILLs the parent before the close
+    // handler runs can leave a previous Go server still bound to 7842.
+    // Without this the next start fails immediately with "address already
+    // in use". We force-kill anything holding the port and give the OS a
+    // moment to release the socket before spawning. Safe to run when the
+    // port is free — lsof simply returns nothing.
+    free_port_blocking(SERVER_PORT);
+    sleep(Duration::from_millis(200)).await;
+
     // STEP 2: spawn `go run .` with stdout/stderr piped so we can log it.
     // We create a new process group (on unix) so that when we later kill the
     // process, the go toolchain's child binary gets cleaned up too — without
@@ -370,6 +380,43 @@ async fn wait_for_port() {
             return;
         }
         sleep(STARTUP_POLL).await;
+    }
+}
+
+// Force-release a TCP port by SIGKILLing any process holding it. Shells
+// out to `lsof -ti tcp:<port>` (macOS / linux) which prints one pid per
+// line of holders, then signals each. This is the brute-force backstop
+// for stale go-server processes leaked by previous dev sessions; the
+// graceful shutdown path in stop_server / signal_shutdown_sync handles
+// the common case.
+//
+// SWAP: replace with a platform-specific implementation if we ever need
+// Windows support — `netstat -ano | findstr :<port>` then `taskkill /F`.
+fn free_port_blocking(port: u16) {
+    let out = match std::process::Command::new("lsof")
+        .args(["-ti", &format!("tcp:{port}")])
+        .output()
+    {
+        Ok(o) => o,
+        // lsof missing or unreachable. Nothing we can do here; the spawn
+        // below will surface a clear EADDRINUSE if the port is actually
+        // held.
+        Err(_) => return,
+    };
+    if !out.status.success() {
+        return;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for pid_str in stdout.split_whitespace() {
+        if let Ok(pid) = pid_str.parse::<i32>() {
+            // SAFETY: kill is a direct libc syscall; pid came from lsof
+            // and is at worst stale (kill returns ESRCH, harmless).
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+            eprintln!("[server] freed port {port} (killed pid {pid})");
+        }
     }
 }
 

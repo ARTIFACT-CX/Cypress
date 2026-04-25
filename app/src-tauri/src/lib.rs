@@ -33,7 +33,24 @@ pub fn run() {
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { .. } = event {
                 let state = window.state::<ServerState>();
-                let _ = signal_shutdown_sync(&state);
+                // STEP 1: SIGTERM the go server's process group so it can
+                // run its graceful shutdown (which also tells the python
+                // worker to exit).
+                let pgid = signal_shutdown_sync(&state);
+                // STEP 2: give the graceful path a beat to release the
+                // listener, then SIGKILL the group as a backstop. Without
+                // this, a slow shutdown (worker still draining, etc.) can
+                // leave the port bound after the rust process is reaped —
+                // the next launch then fails with EADDRINUSE. Blocking the
+                // close handler briefly is fine; the user expects a small
+                // pause on quit.
+                if let Some(pgid) = pgid {
+                    std::thread::sleep(std::time::Duration::from_millis(400));
+                    #[cfg(unix)]
+                    unsafe {
+                        libc::killpg(pgid, libc::SIGKILL);
+                    }
+                }
             }
         })
         .run(tauri::generate_context!())
