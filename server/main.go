@@ -1,13 +1,17 @@
-// AREA: server · ENTRY
-// Cypress orchestration server. Boots the HTTP + WebSocket listener, owns the
-// Python inference worker lifecycle, and routes audio frames between the UI
-// and the active model.
+// AREA: server · ENTRY · COMPOSITION-ROOT
+// Cypress orchestration server. Boots the HTTP listener, constructs the
+// long-lived feature components, wires them together, and routes the
+// shutdown signal back through them.
+//
+// This file is intentionally thin — every concrete handler, business-
+// logic struct, and adapter lives inside its feature package. main.go
+// is the *only* place where features are introduced to each other,
+// which keeps the cross-feature wiring grep-able to one location.
 
 package main
 
 import (
 	"context"
-	"encoding/json"
 	"log"
 	"net"
 	"net/http"
@@ -18,7 +22,6 @@ import (
 
 	"github.com/ARTIFACT-CX/cypress/server/audio"
 	"github.com/ARTIFACT-CX/cypress/server/inference"
-	"github.com/ARTIFACT-CX/cypress/server/transport"
 )
 
 // SETUP: default listen address. The UI connects here from localhost; we don't
@@ -26,68 +29,25 @@ import (
 const listenAddr = "127.0.0.1:7842"
 
 func main() {
-	// STEP 1: build the long-lived subsystems. Each one is created in "idle"
-	// state — starting the Python worker or opening an audio pipeline happens
-	// later, in response to explicit UI commands.
+	// STEP 1: build the long-lived feature components. Each one is created
+	// in "idle" state — starting the Python worker or opening an audio
+	// pipeline happens later, in response to explicit UI commands.
 	inferenceMgr := inference.NewManager()
+	// WHY: inferenceMgr satisfies audio.InferenceClient (the interface
+	// declared inside the audio feature). Passing it as an interface
+	// keeps audio decoupled from inference's concrete type.
 	audioPipeline := audio.NewPipeline(inferenceMgr)
-	wsHandler := transport.NewWSHandler(audioPipeline)
+	wsHandler := audio.NewWSHandler(audioPipeline)
 
-	// STEP 2: wire HTTP routes. `/health` is the liveness probe the Tauri UI
-	// polls after spawning this process; `/ws` upgrades into the binary audio
-	// stream.
+	// STEP 2: wire HTTP routes. Each feature's inbound adapter registers
+	// its own routes onto the shared mux; main.go just owns the mux.
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok"))
 	})
 	mux.Handle("/ws", wsHandler)
-
-	// STEP 2a: inference control endpoints. The UI hits these directly via
-	// fetch() from localhost — no Rust bridge needed since the traffic is
-	// intra-machine and same-origin from Tauri's perspective.
-	mux.HandleFunc("/status", func(w http.ResponseWriter, _ *http.Request) {
-		// Snapshot carries {state, model, device, phase} in one atomic
-		// read — see inference.Manager.Status.
-		writeJSON(w, http.StatusOK, inferenceMgr.Status())
-	})
-	mux.HandleFunc("/model/load", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
-		var body struct {
-			Name string `json:"name"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
-			http.Error(w, "invalid json body", http.StatusBadRequest)
-			return
-		}
-		if body.Name == "" {
-			http.Error(w, "missing 'name'", http.StatusBadRequest)
-			return
-		}
-		// WHY: fire-and-forget. First-run model downloads can take many
-		// minutes, and the browser's fetch would time out long before the
-		// download finishes — leaving the UI thinking the load failed
-		// while the worker is still happily pulling weights. Instead we
-		// kick the load off in a background goroutine (with a generous
-		// upper bound so a wedged loader can't pin the worker forever)
-		// and let the UI drive completion from /status polling. The
-		// Snapshot carries state + phase + error, which is everything
-		// the UI needs to render the outcome.
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
-			defer cancel()
-			if err := inferenceMgr.LoadModel(ctx, body.Name); err != nil {
-				log.Printf("load_model %q failed: %v", body.Name, err)
-			}
-		}()
-		writeJSON(w, http.StatusAccepted, map[string]any{
-			"ok":    true,
-			"model": body.Name,
-		})
-	})
+	inference.RegisterRoutes(mux, inferenceMgr)
 
 	srv := &http.Server{
 		Addr:              listenAddr,
@@ -134,6 +94,11 @@ func main() {
 // but the browser still enforces same-origin on the Tauri UI's dev server
 // (http://localhost:1420). Without these headers fetch() from the UI fails
 // with an opaque "access control checks" error.
+//
+// Lives in main.go (the composition root) rather than a feature because
+// CORS is a cross-cutting concern of the HTTP listener itself, not of any
+// individual feature's adapter. Promote to shared/httpx if a second
+// listener ever needs it.
 func withCORS(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
@@ -145,13 +110,4 @@ func withCORS(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
-}
-
-// writeJSON is a tiny helper so the HTTP handlers above aren't littered
-// with the same three lines. Keeps Content-Type correct and the status
-// code explicit at the call site.
-func writeJSON(w http.ResponseWriter, status int, body any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(body)
 }

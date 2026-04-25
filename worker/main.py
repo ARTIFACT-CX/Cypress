@@ -1,11 +1,16 @@
 """
-AREA: worker · ENTRY
+AREA: worker · ENTRY · COMPOSITION-ROOT
 
 Cypress Python inference worker. Launched as a subprocess by the Go
 orchestration server. Speaks two channels:
 
-  - stdin / stdout : JSON-line control protocol (see ipc_commands.py)
+  - stdin / stdout : JSON-line control protocol (see ipc/commands.py)
   - unix socket    : binary audio frames, path announced in handshake
+
+This file is the composition root: it imports each feature, wires them
+together, and starts the run loop. Cross-feature wiring (models →
+ipc.run_loop) lives only here so the dependency graph between features
+stays grep-able to one place.
 
 On startup it opens the audio socket, prints a ready handshake on stdout,
 and then runs the control loop until the host closes stdin or sends
@@ -20,7 +25,12 @@ import sys
 import traceback
 
 import audio
-import ipc_commands
+import ipc
+# WHY: importing `models` triggers each concrete model's @register
+# decorator and populates models.REGISTRY. We do that here, in the
+# composition root, then hand the populated registry to ipc — keeping
+# ipc unaware of the models feature.
+import models
 
 
 # SETUP: the unix socket path is derived from our pid so multiple workers
@@ -52,9 +62,10 @@ async def _run() -> None:
     _write({"ready": True, "audio_socket": sock_path})
 
     # STEP 3: run the control loop. Returns when stdin EOFs or a shutdown
-    # command is received.
+    # command is received. We pass the model registry as an explicit
+    # dependency so ipc never imports from the models feature.
     try:
-        await ipc_commands.run_loop(_write)
+        await ipc.run_loop(_write, models.REGISTRY)
     finally:
         # STEP 4: clean up the audio socket even on error paths so we don't
         # leave stale sockets in /tmp for the next run.

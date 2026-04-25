@@ -1,5 +1,5 @@
 """
-AREA: worker · AUDIO
+AREA: worker · AUDIO · SOCKET · INBOUND-ADAPTER
 
 Unix-domain socket server that carries binary audio frames between the Go
 orchestration server and the Python worker. Data format is raw PCM 16-bit
@@ -7,7 +7,7 @@ mono @ 24kHz — matching Moshi's native sample rate.
 
 The scaffold intentionally does no real audio processing; it just accepts a
 connection, drains incoming bytes, and logs. Real routing (frames → model
-→ frames back) lands when the first model implementation arrives.
+→ frames back) lands when the streaming session arrives.
 
 SWAP: transport. Unix sockets are local-only and fast. If we ever need the
 worker to run on a different machine (remote inference pool), swap this for

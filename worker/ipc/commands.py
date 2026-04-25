@@ -1,5 +1,5 @@
 """
-AREA: worker · COMMANDS
+AREA: worker · IPC · COMMANDS
 
 Reads JSON-line commands from stdin and writes JSON-line replies via the
 `write` callback supplied by main.py. One command = one reply, always.
@@ -15,9 +15,14 @@ The `id` field is optional but the host typically sets it to correlate
 async requests. We echo it back verbatim so the host can match replies to
 outstanding requests.
 
+Cross-feature boundary: this module never imports from `models` or any
+other feature directly. Instead it accepts a `ModelRegistry` at startup
+(see ports.py) and looks models up through that. The composition root
+(main.py) is the only place that knows about both ipc and models.
+
 SWAP: handler table. Adding a new command is one entry here plus one
-function. If the handler table grows large we'll split per-category files
-(model commands, audio commands, tool commands) and compose them here.
+function. If the handler table grows large we'll split per-category
+modules (model commands, audio commands, tool commands) and compose them.
 """
 
 import asyncio
@@ -25,8 +30,7 @@ import json
 import sys
 from typing import Any, Awaitable, Callable
 
-import models  # noqa: F401 — import to populate models.REGISTRY via side-effect
-from models import REGISTRY
+from .ports import ModelRegistry
 
 # SETUP: shared worker state. The model instance is kept so load_model
 # can cleanly unload the previous one before swapping. device is surfaced
@@ -37,21 +41,25 @@ _state: dict[str, Any] = {
     "device": None,  # Device string ("mps", "cuda", "cpu") or None.
 }
 
-# SETUP: the write function passed in by run_loop gets stashed here so
-# event emits from nested code (model loaders, etc.) can reach stdout
-# without every layer having to pass the callback down.
+# SETUP: dependencies wired in by run_loop. Stashing them as module
+# globals (rather than threading them through every handler signature)
+# matches the singleton nature of the worker — there is exactly one
+# control loop per process, so per-call injection would be ceremony.
 _write_fn: "WriteFn | None" = None
+_registry: ModelRegistry | None = None
 
 
 Handler = Callable[[dict], Awaitable[dict]]
 WriteFn = Callable[[dict], None]
 
 
-def _emit_event(msg: dict) -> None:
+def emit_event(msg: dict) -> None:
     # Events are worker→host one-way messages with no id. The host
     # readLoop routes them into a Manager event handler rather than any
     # waiter channel. Keeping them out-of-band means they never collide
-    # with pending request/reply pairs.
+    # with pending request/reply pairs. Public so other features (audio,
+    # eventually session) can push events without depending on commands'
+    # internals.
     if _write_fn is not None:
         _write_fn(msg)
 
@@ -72,9 +80,10 @@ async def _handle_load_model(msg: dict) -> dict:
     if not isinstance(name, str) or not name:
         return {"error": "missing or invalid 'name'"}
 
-    cls = REGISTRY.get(name)
+    assert _registry is not None, "registry not wired; call run_loop first"
+    cls = _registry.get(name)
     if cls is None:
-        known = ", ".join(sorted(REGISTRY.keys())) or "(none registered)"
+        known = ", ".join(sorted(_registry.keys())) or "(none registered)"
         return {"error": f"unknown model {name!r}; known: {known}"}
 
     # STEP 2: unload any previously loaded model so we don't double up
@@ -91,8 +100,8 @@ async def _handle_load_model(msg: dict) -> dict:
         _state["device"] = None
 
     # STEP 3: instantiate and load. The loader handles its own phase
-    # events via _emit_event so the host can relay them to the UI.
-    instance = cls(_emit_event)
+    # events via emit_event so the host can relay them to the UI.
+    instance = cls(emit_event)
     try:
         await instance.load()
     except Exception as e:
@@ -143,12 +152,12 @@ async def _stdin_reader() -> asyncio.StreamReader:
     return reader
 
 
-async def run_loop(write: WriteFn) -> None:
-    # Stash the write fn for out-of-band event emits (model phase updates
-    # etc.). run_loop is the single entry point, so doing it once here
-    # covers every downstream caller.
-    global _write_fn
+async def run_loop(write: WriteFn, registry: ModelRegistry) -> None:
+    # Stash the wired dependencies. run_loop is the single entry point,
+    # so doing it once here covers every downstream caller.
+    global _write_fn, _registry
     _write_fn = write
+    _registry = registry
 
     reader = await _stdin_reader()
 

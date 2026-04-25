@@ -4,15 +4,11 @@
 // worker; model output (audio + text) flows back out to the UI.
 //
 // This file is intentionally transport- and model-agnostic. The WS handler
-// pushes frames in via Ingest(); the inference manager pulls frames out via
-// Read(). Either end can be swapped (WebRTC transport, remote inference)
-// without touching the pipeline.
+// pushes frames in via Ingest(); the inference client (injected) pulls
+// frames out. Either end can be swapped (WebRTC transport, remote
+// inference) without touching the pipeline.
 
 package audio
-
-import (
-	"github.com/ARTIFACT-CX/cypress/server/inference"
-)
 
 // Frame is one chunk of audio. We use raw PCM 16-bit mono @ 24kHz in v0.1
 // because that's Moshi's native rate and avoids encode/decode latency on
@@ -28,17 +24,20 @@ type Frame struct {
 // SWAP: Pipeline is the single join point between transports and models.
 // Keep it thin — no model logic, no codec logic, just plumbing.
 type Pipeline struct {
-	inference *inference.Manager
+	// SAFETY: depend on the InferenceClient port, never the concrete
+	// inference.Manager type. Cross-feature dependencies must go through
+	// an interface declared in this package (see ports.go).
+	inference InferenceClient
 
 	// TODO: ring buffer for mic frames, subscriber list for model output
 	// frames, cancellation plumbing.
 }
 
-// NewPipeline wires a new pipeline to the given inference manager. The
-// pipeline does not start the manager — callers decide when to spin up the
+// NewPipeline wires a new pipeline to the given inference client. The
+// pipeline does not start anything — callers decide when to spin up the
 // Python worker.
-func NewPipeline(mgr *inference.Manager) *Pipeline {
-	return &Pipeline{inference: mgr}
+func NewPipeline(client InferenceClient) *Pipeline {
+	return &Pipeline{inference: client}
 }
 
 // Ingest receives a mic frame from the transport and forwards it toward the

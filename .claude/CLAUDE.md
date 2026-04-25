@@ -18,6 +18,43 @@ Local models on disk
 
 Models: **Moshi 3.5B** (default, lighter) and **PersonaPlex 7B** (NVIDIA, duplex + persona conditioning). Future: Kokoro, Orpheus TTS.
 
+## Structure
+
+**Scope:** this applies to **`server/` (Go) and `worker/` (Python)**. The React app (`app/`) is exempt for now — it stays component-organized until it grows enough to need the discipline.
+
+Within `server/` and `worker/`, code is organized **by feature** (vertical slice), not by technical layer. A feature owns one capability end-to-end: its business logic, the adapters that connect it inward (HTTP handlers, IPC commands), and the adapters that connect it outward (clients for external deps), plus the interfaces those adapters satisfy.
+
+```
+server/
+  inference/                ← feature
+    manager.go              business logic
+    worker.go               outbound adapter (Python subprocess)
+    handlers.go             inbound adapter (HTTP routes)
+  audio/                    ← feature
+    pipeline.go
+    transport.go
+  shared/                   infrastructure only — no domain
+    log/
+    config/
+```
+
+**Rules:**
+
+- **Features don't import from other features.** Cross-feature needs go through a public interface, or get coordinated by a dedicated orchestration feature.
+- **`shared/` is infrastructure only** — logger, config, DB connection, event bus. The moment something there knows about a domain concept, it moves into a feature.
+- **No `utils/` folder.** Shared packages are named for what they do (`shared/log`, not `shared/utils`).
+- **Prefer duplication over premature abstraction.** Two features doing similar things stay separate until they've proven they should be identical.
+- **Inside a feature, business logic depends on interfaces.** Concrete adapters are injected at startup (ports & adapters / hexagonal). Adapter interfaces are natural `// SWAP:` seams — no separate tagging needed.
+- **Split a feature when it grows unwieldy.** Smaller features compose better than one big one.
+
+The Tauri/Go/Python service split stays as it is — feature slicing is the rule **inside** `server/` and `worker/`, not across services. Both the Go server and the Python worker follow this layout; concrete file names differ (Python uses packages of `__init__.py` modules where Go uses `package` directories), but the feature-as-vertical-slice idea is the same.
+
+### AI codegen scope
+
+- A feature is the natural prompt boundary. Generated changes should stay inside one feature when possible.
+- Before adding code: does it belong in an existing feature, warrant a new one, or is it genuinely shared infrastructure? Default to "existing feature" unless there's a real reason otherwise.
+- Don't expand `shared/` without justification — it's the fastest way for this structure to rot.
+
 ## Coding Style
 
 ### Comments
@@ -57,7 +94,7 @@ Format: `AREA: <domain> · <subsystem> [· <sub-subsystem>]`. Categories we'll u
 ### Modularity
 
 - Each module should have a **single, stated purpose** (top-of-file comment).
-- Any part of the system we might swap later (models, transports, tools, UI components) lives behind a clear interface. Mark the seam with `// SWAP:`.
+- Any part of the system we might swap later (models, transports, tools, UI components) lives behind a clear interface — same seam as feature adapter interfaces (see Structure). Mark with `// SWAP:`.
 - Prefer small files with obvious names over large catch-all modules.
 
 ### Conciseness

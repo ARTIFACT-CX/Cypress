@@ -1,29 +1,30 @@
-// AREA: transport · WS
+// AREA: audio · WS · INBOUND-ADAPTER
 // The WebSocket endpoint the Tauri UI connects to. Upgrades an HTTP request
 // into a bidirectional binary channel carrying audio frames in both
 // directions. Transport-layer concerns only: framing, backpressure, connection
-// lifecycle. Audio semantics live in the audio package.
+// lifecycle. Audio semantics live in pipeline.go.
+//
+// This is audio's *inbound adapter* — the way the outside world (the UI)
+// gets frames into the pipeline. Lives in the audio feature because its
+// reason to exist is entirely about audio I/O.
 //
 // SWAP: v0.1 uses WebSocket because everything runs on localhost and TCP
 // latency is negligible. If/when we add a cloud inference tier, we'll likely
-// introduce a second transport (WebRTC) that plugs into the same audio
-// pipeline.
+// introduce a second transport (WebRTC) that plugs into the same pipeline.
 
-package transport
+package audio
 
 import (
 	"net/http"
-
-	"github.com/ARTIFACT-CX/cypress/server/audio"
 )
 
 // WSHandler upgrades /ws into a binary audio channel.
 type WSHandler struct {
-	pipeline *audio.Pipeline
+	pipeline *Pipeline
 }
 
-// NewWSHandler wires the WS endpoint to the shared audio pipeline.
-func NewWSHandler(p *audio.Pipeline) *WSHandler {
+// NewWSHandler wires the WS endpoint to the audio pipeline.
+func NewWSHandler(p *Pipeline) *WSHandler {
 	return &WSHandler{pipeline: p}
 }
 
