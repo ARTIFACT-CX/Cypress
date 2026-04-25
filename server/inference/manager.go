@@ -39,6 +39,23 @@ const (
 	StateServing  State = "serving"  // worker alive, model loaded
 )
 
+// workerHandle is the part of the worker subprocess Manager actually uses.
+// Declared as an interface so unit tests can swap in a fake without
+// spawning a real Python process. The concrete *worker satisfies it.
+//
+// SWAP: this is the seam between Manager (business logic) and the
+// outbound subprocess adapter. A future remote-inference backend
+// implements the same interface against gRPC instead of stdin/stdout.
+type workerHandle interface {
+	send(ctx context.Context, cmd string, extra map[string]any) (map[string]any, error)
+	stop(ctx context.Context) error
+	setOnEvent(fn func(map[string]any))
+}
+
+// spawnFn is the constructor for a workerHandle. NewManager defaults this
+// to the real spawnWorker; tests inject a fake.
+type spawnFn func(ctx context.Context, dir string) (workerHandle, error)
+
 // Manager is the Go-side handle to the Python inference worker.
 type Manager struct {
 	// SAFETY: mu guards all mutable state. Exported methods must take mu
@@ -47,7 +64,7 @@ type Manager struct {
 	// "busy" error from the state check.
 	mu     sync.Mutex
 	state  State
-	worker *worker
+	worker workerHandle
 	model  string
 	device string // populated on successful load; "mps" / "cuda" / "cpu"
 	phase  string // current loader phase ("downloading_mimi", etc.), cleared on ready
@@ -55,6 +72,10 @@ type Manager struct {
 	// even when it polled in after the failing HTTP request already returned.
 	// Cleared when a new load starts so stale errors don't linger.
 	lastError string
+
+	// spawn is the worker constructor. Defaults to the real subprocess
+	// spawner; tests override via newManagerWithSpawn.
+	spawn spawnFn
 }
 
 // Snapshot is the Manager's external view — what the HTTP /status endpoint
@@ -74,7 +95,19 @@ type Snapshot struct {
 // deferred until the UI asks for a model — spawning Python at server boot
 // would add seconds of latency before the UI could even connect.
 func NewManager() *Manager {
-	return &Manager{state: StateIdle}
+	return &Manager{state: StateIdle, spawn: defaultSpawn}
+}
+
+// newManagerWithSpawn is the test constructor. Lets a unit test inject a
+// fake spawner without going through subprocess machinery.
+func newManagerWithSpawn(spawn spawnFn) *Manager {
+	return &Manager{state: StateIdle, spawn: spawn}
+}
+
+// defaultSpawn adapts the package's real spawnWorker (which returns the
+// concrete *worker) into the workerHandle interface Manager depends on.
+func defaultSpawn(ctx context.Context, dir string) (workerHandle, error) {
+	return spawnWorker(ctx, dir)
 }
 
 // LoadModel kicks off a model load. Returns synchronously as soon as the
@@ -133,7 +166,7 @@ func (m *Manager) doLoad(ctx context.Context, name string) {
 	m.mu.Unlock()
 
 	if needSpawn {
-		w, err := spawnWorker(ctx, workerDir())
+		w, err := m.spawn(ctx, workerDir())
 		m.mu.Lock()
 		if err != nil {
 			m.state = StateIdle
@@ -142,7 +175,7 @@ func (m *Manager) doLoad(ctx context.Context, name string) {
 			log.Printf("worker spawn failed: %v", err)
 			return
 		}
-		w.onEvent = m.handleEvent
+		w.setOnEvent(m.handleEvent)
 		m.worker = w
 		m.state = StateLoading
 		m.mu.Unlock()

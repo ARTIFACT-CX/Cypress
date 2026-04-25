@@ -309,6 +309,12 @@ func (w *worker) stop(ctx context.Context) error {
 	}
 }
 
+// setOnEvent is part of the workerHandle interface (see manager.go). The
+// Manager calls this immediately after spawn to register its event handler;
+// keeping it a method (rather than a public field) lets fakes implement it
+// without exposing concurrent-write surface on the real worker struct.
+func (w *worker) setOnEvent(fn func(map[string]any)) { w.onEvent = fn }
+
 func (w *worker) kill() error {
 	if w.cmd == nil || w.cmd.Process == nil {
 		return nil

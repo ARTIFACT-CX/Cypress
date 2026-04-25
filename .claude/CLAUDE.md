@@ -110,6 +110,59 @@ Format: `AREA: <domain> · <subsystem> [· <sub-subsystem>]`. Categories we'll u
 
 When a comment would be longer than the code, the code should probably be simpler.
 
+## Testing
+
+**Scope:** applies to **`server/` (Go) and `worker/` (Python)**. The React app (`app/`) is exempt for now.
+
+Test-driven development is the default. New non-trivial code lands with tests. Trivial glue (a handler that decodes JSON and calls one method, a struct field accessor) doesn't need a test — don't pad coverage with tests of the framework.
+
+### Unit vs integration
+
+- **Unit tests** cover function-level logic: branches, error paths, state transitions, parsing, framing, dispatch. Heavy dependencies (real subprocess, real model load, real network) are faked. Fast — a unit suite should run in seconds.
+- **Integration tests** cover a feature's full flow with real adapters: HTTP → manager → real Python subprocess → reply, IPC framing over a real pipe, audio path over a real socket. Slower; run before commit, not on every edit.
+
+### Layout
+
+Tests live alongside the code they test, inside the feature folder. This is the Go convention (required for access to unexported symbols) and a fine Python convention too — keeps the feature self-contained.
+
+```
+server/inference/
+  manager.go
+  manager_test.go           ← unit
+  worker.go
+  worker_test.go            ← unit
+  integration_test.go       ← integration (build tag: //go:build integration)
+  testdata/                 ← fixtures, golden files
+
+worker/models/
+  moshi.py
+  test_moshi.py             ← unit
+  test_integration.py       ← integration (pytest marker: @pytest.mark.integration)
+  testdata/
+```
+
+- File naming: Go `<name>_test.go`, Python `test_<name>.py` — language-idiomatic, picked up by `go test` / `pytest` automatically.
+- Test naming: `unit_under_test_scenario_expectation`. Go: `TestManager_LoadModel_RejectsWhenBusy`. Python: `test_load_model_rejects_when_busy`. Greppable.
+- Integration tests are gated so a default `go test ./...` / `pytest` runs only the fast unit suite. Run integration explicitly: `go test -tags=integration ./...`, `pytest -m integration`.
+
+### When to write them
+
+- **New business logic / state machine / parser:** test-first. Red → green → refactor.
+- **New adapter glue:** test-alongside. Write the code and its unit test in the same change.
+- **Bug fix:** add the failing test first, then the fix. The test stays as a regression guard.
+
+### When to run them
+
+- **After editing a file inside a feature:** run that feature's unit tests. `go test ./inference/...` or `pytest worker/models/`. Feature-scoped, fast.
+- **Before committing a feature change:** run the full unit suite + the relevant integration tests.
+- **Before committing a cross-feature or infrastructure change:** run everything, both suites.
+- A failing test blocks the commit. Don't skip, don't `t.Skip()`, don't comment it out — fix it or fix the code.
+
+### Fakes and fixtures
+
+- Per-feature fakes live in the feature's test files (or a `fakes_test.go` / `conftest.py` if shared across that feature's tests). Don't build a global mocking framework.
+- Byte-level fixtures (IPC frames, audio chunks, golden JSON replies) live in `testdata/` rather than being rebuilt inline — keeps tests readable and lets us diff against known-good bytes.
+
 ## Process
 
 ### Ask clarifying questions
