@@ -17,12 +17,68 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/ARTIFACT-CX/cypress/server/audio"
 	"github.com/ARTIFACT-CX/cypress/server/inference"
 )
+
+// inferenceAdapter bridges *inference.Manager (concrete, returns its own
+// *inference.Stream) to audio.InferenceClient (abstract, returns the
+// audio-package interface). Lives at the composition root so neither
+// feature has to know about the other's type names — inference doesn't
+// import audio, audio doesn't import inference.
+type inferenceAdapter struct{ mgr *inference.Manager }
+
+func (a *inferenceAdapter) StartStream(ctx context.Context) (audio.StreamSession, error) {
+	s, err := a.mgr.StartStream(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &inferenceStreamAdapter{s: s}, nil
+}
+
+// inferenceStreamAdapter wraps inference.Stream so its Outputs channel
+// (typed []inference.StreamOutput) appears as the audio-package shape.
+// PCM/Text fields are identical so the per-chunk relay is one struct
+// copy per frame — negligible at 12.5 fps.
+type inferenceStreamAdapter struct {
+	s   *inference.Stream
+	out chan audio.StreamOutput
+
+	startOnce  sync.Once
+	closeOnce  sync.Once
+	closeError error
+}
+
+func (a *inferenceStreamAdapter) Feed(ctx context.Context, pcm []byte) error {
+	return a.s.Feed(ctx, pcm)
+}
+
+func (a *inferenceStreamAdapter) SampleRate() int { return a.s.SampleRate() }
+
+func (a *inferenceStreamAdapter) Outputs() <-chan audio.StreamOutput {
+	a.startOnce.Do(func() {
+		// One-shot relay goroutine: forwards inference→audio chunks
+		// until the upstream channel closes, then closes the downstream
+		// channel so the WS writer's `for range` exits cleanly.
+		a.out = make(chan audio.StreamOutput, cap(a.s.Outputs()))
+		go func() {
+			defer close(a.out)
+			for chunk := range a.s.Outputs() {
+				a.out <- audio.StreamOutput{PCM: chunk.PCM, Text: chunk.Text}
+			}
+		}()
+	})
+	return a.out
+}
+
+func (a *inferenceStreamAdapter) Close(ctx context.Context) error {
+	a.closeOnce.Do(func() { a.closeError = a.s.Close(ctx) })
+	return a.closeError
+}
 
 // SETUP: default listen address. The UI connects here from localhost; we don't
 // bind externally because all traffic is intra-machine.
@@ -36,7 +92,7 @@ func main() {
 	// REASON: inferenceMgr satisfies audio.InferenceClient (the interface
 	// declared inside the audio feature). Passing it as an interface
 	// keeps audio decoupled from inference's concrete type.
-	audioPipeline := audio.NewPipeline(inferenceMgr)
+	audioPipeline := audio.NewPipeline(&inferenceAdapter{mgr: inferenceMgr})
 	wsHandler := audio.NewWSHandler(audioPipeline)
 
 	// STEP 2: wire HTTP routes. Each feature's inbound adapter registers

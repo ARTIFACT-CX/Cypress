@@ -76,6 +76,11 @@ type Manager struct {
 	// spawn is the worker constructor. Defaults to the real subprocess
 	// spawner; tests override via newManagerWithSpawn.
 	spawn spawnFn
+
+	// activeStream is the at-most-one streaming session against this
+	// worker. nil when idle. Guarded by mu — see stream.go for the
+	// lifecycle hooks (StartStream / detachStream).
+	activeStream *Stream
 }
 
 // Snapshot is the Manager's external view — what the HTTP /status endpoint
@@ -228,6 +233,11 @@ func (m *Manager) handleEvent(msg map[string]any) {
 			m.device = dev
 		}
 		m.mu.Unlock()
+	case "audio_out", "stream_error":
+		// Stream events go to the active session's channel. Routing
+		// lives in stream.go to keep base64 / chunk-shape concerns out
+		// of the lifecycle state machine.
+		m.dispatchStreamEvent(msg)
 	}
 }
 
