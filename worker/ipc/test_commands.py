@@ -6,6 +6,7 @@ fakes — these run in milliseconds with no torch / HF dependency.
 """
 
 import asyncio
+import base64
 import io
 import json
 from typing import Any, Callable
@@ -268,6 +269,293 @@ async def test_run_wav_surfaces_model_exception_with_type():
     # Type prefix matters — the host UI surfaces it directly, and "permission
     # denied" reads very differently from "FileNotFoundError".
     assert "FileNotFoundError" in reply["error"]
+
+
+# --- streaming handlers ------------------------------------------------------
+
+
+class FakeChunk:
+    """StreamChunk lookalike: the real one is a NamedTuple but the IPC
+    layer only reads .audio_pcm and .text, so a tiny attrs-only object
+    is enough — keeps these tests free of any models/ import."""
+
+    def __init__(self, audio_pcm: bytes, text: str | None):
+        self.audio_pcm = audio_pcm
+        self.text = text
+
+
+class FakeSession:
+    """MoshiStream lookalike: start/feed/aclose + async iteration. Tests
+    push chunks via emit_chunk so we can assert exactly what the drain
+    task surfaces as audio_out events.
+
+    Concurrency-conscious: async iteration parks on _outbox.get() until a
+    chunk arrives or aclose() pushes the EOF sentinel."""
+
+    sample_rate = 24000
+    _EOF = object()
+
+    def __init__(self):
+        self.started = False
+        self.closed = False
+        self.fed: list[bytes] = []
+        self._outbox: asyncio.Queue = asyncio.Queue()
+        self.feed_should_raise: BaseException | None = None
+        self.start_should_raise: BaseException | None = None
+
+    async def start(self) -> None:
+        if self.start_should_raise is not None:
+            raise self.start_should_raise
+        self.started = True
+
+    async def feed(self, pcm: bytes) -> None:
+        if self.feed_should_raise is not None:
+            raise self.feed_should_raise
+        self.fed.append(pcm)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        item = await self._outbox.get()
+        if item is FakeSession._EOF:
+            raise StopAsyncIteration
+        return item
+
+    async def emit_chunk(self, chunk: FakeChunk) -> None:
+        # Helper for tests: inject a chunk that the drain task will pick up.
+        await self._outbox.put(chunk)
+
+    async def aclose(self) -> None:
+        self.closed = True
+        # Unblock any pending __anext__ so the drain task exits cleanly.
+        await self._outbox.put(FakeSession._EOF)
+
+
+class FakeStreamingSessionModel(FakeStreamingModel):
+    """FakeStreamingModel + a stream() method. Separate class so tests
+    that exercise capability gating (model exists but lacks stream)
+    still have a clean fake to point at."""
+
+    name = "streaming-session"
+
+    def __init__(self, emit):
+        super().__init__(emit)
+        self.session = FakeSession()
+        self.stream_calls = 0
+
+    def stream(self) -> FakeSession:
+        self.stream_calls += 1
+        return self.session
+
+
+# start_stream
+
+
+async def test_start_stream_rejects_when_no_model_loaded():
+    reply = await commands._handle_start_stream({})
+    assert "error" in reply
+    assert "no model" in reply["error"]
+
+
+async def test_start_stream_rejects_when_model_lacks_stream():
+    # FakeModel has no stream() — must surface the capability gap rather
+    # than crashing on AttributeError.
+    commands._state["instance"] = FakeModel(emit=lambda _m: None)
+    commands._state["model"] = "fake"
+    reply = await commands._handle_start_stream({})
+    assert "error" in reply
+    assert "stream" in reply["error"]
+
+
+async def test_start_stream_rejects_when_already_active():
+    fake = FakeStreamingSessionModel(emit=lambda _m: None)
+    commands._state["instance"] = fake
+    first = await commands._handle_start_stream({})
+    assert first["ok"] is True
+    try:
+        second = await commands._handle_start_stream({})
+        assert "error" in second
+        assert "already active" in second["error"]
+    finally:
+        await commands._stop_active_stream()
+
+
+async def test_start_stream_returns_sample_rate_and_starts_session():
+    fake = FakeStreamingSessionModel(emit=lambda _m: None)
+    commands._state["instance"] = fake
+    try:
+        reply = await commands._handle_start_stream({})
+        assert reply["ok"] is True
+        assert reply["sample_rate"] == 24000
+        assert fake.session.started is True
+        assert commands._state["stream"] is fake.session
+    finally:
+        await commands._stop_active_stream()
+
+
+async def test_start_stream_surfaces_session_start_failure():
+    # If session.start() blows up (mimi cache alloc failed, say) we must
+    # not leave a half-initialized session in _state.
+    fake = FakeStreamingSessionModel(emit=lambda _m: None)
+    fake.session.start_should_raise = RuntimeError("alloc failed")
+    commands._state["instance"] = fake
+
+    reply = await commands._handle_start_stream({})
+
+    assert "error" in reply
+    assert "RuntimeError" in reply["error"]
+    assert commands._state["stream"] is None
+
+
+# audio_in
+
+
+async def test_audio_in_rejects_when_no_active_stream():
+    reply = await commands._handle_audio_in({"pcm": base64.b64encode(b"\x00\x00").decode()})
+    assert "error" in reply
+    assert "no active stream" in reply["error"]
+
+
+async def test_audio_in_rejects_missing_pcm_field():
+    fake = FakeStreamingSessionModel(emit=lambda _m: None)
+    commands._state["instance"] = fake
+    await commands._handle_start_stream({})
+    try:
+        reply = await commands._handle_audio_in({})
+        assert "error" in reply
+        assert "pcm" in reply["error"]
+    finally:
+        await commands._stop_active_stream()
+
+
+async def test_audio_in_rejects_invalid_base64():
+    fake = FakeStreamingSessionModel(emit=lambda _m: None)
+    commands._state["instance"] = fake
+    await commands._handle_start_stream({})
+    try:
+        reply = await commands._handle_audio_in({"pcm": "not!!base64!!"})
+        assert "error" in reply
+        assert "base64" in reply["error"]
+    finally:
+        await commands._stop_active_stream()
+
+
+async def test_audio_in_decodes_and_feeds_session():
+    raw = b"\x01\x00\x02\x00\x03\x00"
+    fake = FakeStreamingSessionModel(emit=lambda _m: None)
+    commands._state["instance"] = fake
+    await commands._handle_start_stream({})
+    try:
+        reply = await commands._handle_audio_in({"pcm": base64.b64encode(raw).decode()})
+        assert reply == {"ok": True}
+        assert fake.session.fed == [raw]
+    finally:
+        await commands._stop_active_stream()
+
+
+# stop_stream
+
+
+async def test_stop_stream_idempotent_when_inactive():
+    # Defensive call from the host (e.g. on disconnect) must not error.
+    reply = await commands._handle_stop_stream({})
+    assert reply == {"ok": True}
+
+
+async def test_stop_stream_closes_active_session():
+    fake = FakeStreamingSessionModel(emit=lambda _m: None)
+    commands._state["instance"] = fake
+    await commands._handle_start_stream({})
+
+    reply = await commands._handle_stop_stream({})
+
+    assert reply == {"ok": True}
+    assert fake.session.closed is True
+    assert commands._state["stream"] is None
+    assert commands._state["stream_drain"] is None
+
+
+# drain task → audio_out events
+
+
+async def test_drain_task_emits_audio_out_events_with_base64():
+    captured: list[dict] = []
+    commands._write_fn = captured.append
+    fake = FakeStreamingSessionModel(emit=lambda _m: None)
+    commands._state["instance"] = fake
+    await commands._handle_start_stream({})
+    try:
+        await fake.session.emit_chunk(FakeChunk(audio_pcm=b"\xaa\xbb", text="hi"))
+        # Yield to let the drain task pick it up. Loop briefly because
+        # task scheduling order isn't guaranteed in a single sleep(0).
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if captured:
+                break
+    finally:
+        await commands._stop_active_stream()
+
+    assert len(captured) >= 1
+    evt = captured[0]
+    assert evt["event"] == "audio_out"
+    assert base64.b64decode(evt["pcm"]) == b"\xaa\xbb"
+    assert evt["text"] == "hi"
+
+
+async def test_drain_task_passes_none_text_through():
+    # Pad-token frames have text=None; the host renders text only when
+    # present. The event still fires (audio is on every frame).
+    captured: list[dict] = []
+    commands._write_fn = captured.append
+    fake = FakeStreamingSessionModel(emit=lambda _m: None)
+    commands._state["instance"] = fake
+    await commands._handle_start_stream({})
+    try:
+        await fake.session.emit_chunk(FakeChunk(audio_pcm=b"\x00\x00", text=None))
+        for _ in range(20):
+            await asyncio.sleep(0)
+            if captured:
+                break
+    finally:
+        await commands._stop_active_stream()
+
+    assert captured[0]["text"] is None
+
+
+# Cleanup interactions with load_model / unload
+
+
+async def test_unload_stops_active_stream():
+    # Critical: stream holds references to the model's mimi/lm_gen. If we
+    # unloaded without closing the session, the next chunk it processed
+    # would crash on a torn-down model.
+    fake = FakeStreamingSessionModel(emit=lambda _m: None)
+    commands._state["instance"] = fake
+    commands._state["model"] = "streaming-session"
+    await commands._handle_start_stream({})
+
+    await commands._handle_unload({})
+
+    assert fake.session.closed is True
+    assert commands._state["stream"] is None
+    assert commands._state["instance"] is None
+
+
+async def test_load_model_stops_active_stream_before_swap():
+    # Same hazard as unload: a streamed-against model getting swapped out
+    # must not leave a session iterating into a freed mimi.
+    fake = FakeStreamingSessionModel(emit=lambda _m: None)
+    commands._state["instance"] = fake
+    commands._state["model"] = "streaming-session"
+    await commands._handle_start_stream({})
+
+    commands._registry = make_fake_registry(fake=FakeModel)
+    reply = await commands._handle_load_model({"name": "fake"})
+
+    assert reply["ok"] is True
+    assert fake.session.closed is True
+    assert commands._state["stream"] is None
 
 
 # --- emit_event --------------------------------------------------------------

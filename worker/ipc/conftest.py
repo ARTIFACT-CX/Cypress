@@ -21,7 +21,15 @@ def _reset_commands_state():
     saved_write = commands._write_fn
     saved_registry = commands._registry
     try:
-        commands._state.update({"model": None, "instance": None, "device": None})
+        commands._state.update(
+            {
+                "model": None,
+                "instance": None,
+                "device": None,
+                "stream": None,
+                "stream_drain": None,
+            }
+        )
         commands._write_fn = None
         commands._registry = None
         yield

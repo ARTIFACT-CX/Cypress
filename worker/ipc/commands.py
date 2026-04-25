@@ -26,6 +26,7 @@ modules (model commands, audio commands, tool commands) and compose them.
 """
 
 import asyncio
+import base64
 import json
 import sys
 from typing import Any, Awaitable, Callable
@@ -39,6 +40,11 @@ _state: dict[str, Any] = {
     "model": None,  # Name of the currently loaded model, or None.
     "instance": None,  # Live Model subclass instance, or None.
     "device": None,  # Device string ("mps", "cuda", "cpu") or None.
+    # Streaming: at most one active session per worker (mimi/lm_gen are
+    # stateful; concurrent sessions would corrupt each other). The drain
+    # task runs alongside, pulling output chunks and emitting events.
+    "stream": None,  # MoshiStream-shaped session instance, or None.
+    "stream_drain": None,  # asyncio.Task draining session → audio_out events.
 }
 
 # SETUP: dependencies wired in by run_loop. Stashing them as module
@@ -89,6 +95,7 @@ async def _handle_load_model(msg: dict) -> dict:
     # STEP 2: unload any previously loaded model so we don't double up
     # on VRAM. Swallow errors from the old one — we're throwing it away
     # anyway, and a failed unload shouldn't block a new load.
+    await _stop_active_stream()
     prev = _state["instance"]
     if prev is not None:
         try:
@@ -116,6 +123,10 @@ async def _handle_load_model(msg: dict) -> dict:
 
 
 async def _handle_unload(_msg: dict) -> dict:
+    # Stop any active stream first — its session holds a reference to the
+    # model's mimi/lm_gen and would crash mid-iteration if we yanked the
+    # instance out from under it.
+    await _stop_active_stream()
     prev = _state["instance"]
     if prev is not None:
         try:
@@ -168,12 +179,140 @@ async def _handle_run_wav(msg: dict) -> dict:
     return {"ok": True, **info}
 
 
+async def _handle_start_stream(_msg: dict) -> dict:
+    # Open a realtime streaming session against the loaded model. After
+    # this returns, the host can fire `audio_in` commands and receive
+    # `audio_out` events asynchronously until `stop_stream`.
+    instance = _state["instance"]
+    if instance is None:
+        return {"error": "no model loaded"}
+
+    # Capability gate, same shape as run_wav: a model that doesn't expose
+    # stream() (PersonaPlex eventually, or a non-duplex backend) gets
+    # rejected here rather than crashing inside the handler.
+    if not hasattr(instance, "stream"):
+        return {"error": f"loaded model {_state['model']!r} does not support stream"}
+
+    # Reject double-open rather than silently replacing the active session
+    # — the host bug that caused this is more useful surfaced than hidden.
+    if _state["stream"] is not None:
+        return {"error": "stream already active; call stop_stream first"}
+
+    try:
+        session = instance.stream()
+        await session.start()
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+
+    _state["stream"] = session
+    # Spawn the drain task before returning so the host can start sending
+    # audio_in immediately — by the time the start_stream reply lands, the
+    # output side is already wired up.
+    _state["stream_drain"] = asyncio.create_task(
+        _drain_stream(session), name="ipc-stream-drain"
+    )
+    # Surface the session's audio rate so the host doesn't have to know
+    # which model is loaded to pick a playback rate. Falls back silently
+    # if a session lacks the attribute (older fakes in tests).
+    sample_rate = getattr(session, "sample_rate", None)
+    reply: dict[str, Any] = {"ok": True}
+    if sample_rate is not None:
+        reply["sample_rate"] = int(sample_rate)
+    return reply
+
+
+async def _handle_audio_in(msg: dict) -> dict:
+    # Push one chunk of caller-supplied PCM into the active session. The
+    # session reframes internally; payload size doesn't have to match the
+    # model's frame size. We keep the reply small ({"ok":true}) — the host
+    # fires this fast and doesn't await each one.
+    session = _state["stream"]
+    if session is None:
+        return {"error": "no active stream; call start_stream first"}
+
+    pcm_b64 = msg.get("pcm")
+    if not isinstance(pcm_b64, str):
+        return {"error": "missing or invalid 'pcm' (expected base64 string)"}
+    try:
+        pcm = base64.b64decode(pcm_b64, validate=True)
+    except (ValueError, base64.binascii.Error) as e:
+        return {"error": f"invalid base64 pcm: {e}"}
+
+    try:
+        await session.feed(pcm)
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+    return {"ok": True}
+
+
+async def _handle_stop_stream(_msg: dict) -> dict:
+    # Idempotent: stop_stream with no active session is a no-op, not an
+    # error. Lets the host call it defensively (e.g. from a "hang up"
+    # button) without tracking state.
+    await _stop_active_stream()
+    return {"ok": True}
+
+
+async def _drain_stream(session: Any) -> None:
+    """Worker→host pump for one streaming session. Runs as an asyncio task
+    spawned by start_stream; ends naturally when the session emits its EOF
+    sentinel (i.e. when stop_stream → session.aclose() runs)."""
+    try:
+        async for chunk in session:
+            # Base64 keeps audio inline in the JSON IPC for v0.1 (see #20
+            # for the planned sidechannel optimization). text is None on
+            # most frames since inner-monologue tokens are sparse.
+            emit_event(
+                {
+                    "event": "audio_out",
+                    "pcm": base64.b64encode(chunk.audio_pcm).decode("ascii"),
+                    "text": chunk.text,
+                }
+            )
+    except asyncio.CancelledError:
+        # Cooperative shutdown via _stop_active_stream(). Not actionable.
+        pass
+    except Exception as e:
+        # Surface unexpected drain failures as an event so the host UI
+        # can show a useful error rather than just "stream went silent."
+        emit_event({"event": "stream_error", "error": f"{type(e).__name__}: {e}"})
+
+
+async def _stop_active_stream() -> None:
+    """Tear down the active session + drain task, if any. Safe to call
+    when nothing is active. Used by stop_stream and by load_model/unload
+    to avoid leaking sessions across model swaps."""
+    session = _state["stream"]
+    drain = _state["stream_drain"]
+    _state["stream"] = None
+    _state["stream_drain"] = None
+    if session is not None:
+        try:
+            await session.aclose()
+        except Exception:
+            # We're throwing the session away — a failing aclose isn't
+            # worth surfacing or blocking on.
+            pass
+    if drain is not None:
+        # aclose() above sends the EOF sentinel which lets the drain task
+        # exit naturally; awaiting it here just collects the result.
+        # Cancel as a belt-and-suspenders in case aclose stalled.
+        drain.cancel()
+        try:
+            await drain
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
 _HANDLERS: dict[str, Handler] = {
     "status": _handle_status,
     "load_model": _handle_load_model,
     "unload": _handle_unload,
     "shutdown": _handle_shutdown,
     "run_wav": _handle_run_wav,
+    "start_stream": _handle_start_stream,
+    "audio_in": _handle_audio_in,
+    "stop_stream": _handle_stop_stream,
 }
 
 

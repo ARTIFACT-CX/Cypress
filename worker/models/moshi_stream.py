@@ -92,6 +92,13 @@ class MoshiStream:
         self._started = False
         self._closed = False
 
+    @property
+    def sample_rate(self) -> int:
+        """Output PCM sample rate in Hz. Surfaced so the IPC layer (and
+        eventually the audio transport) can tell consumers the playback
+        rate without having to peek at mimi internals."""
+        return self._c.sample_rate
+
     async def start(self) -> None:
         """Initialize streaming state and spawn the worker task. Must be
         awaited before feed() / iteration. Idempotent."""
