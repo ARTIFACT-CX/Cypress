@@ -66,3 +66,21 @@ def test_moshi_initial_state_is_unloaded():
     # status reporter so the UI doesn't show a stale device string.
     instance = moshi.Moshi(emit=lambda _msg: None)
     assert instance.device() is None
+
+
+def test_moshi_exposes_run_wav():
+    # The IPC handler gates run_wav requests on hasattr(instance,
+    # "run_wav"); accidentally renaming/removing the method here would
+    # silently make the offline self-test reject every request as
+    # "model does not support run_wav". This test pins the public name.
+    assert callable(getattr(moshi.Moshi, "run_wav", None))
+
+
+def test_moshi_run_wav_rejects_when_unloaded():
+    # Defensive: the IPC handler gates on `instance is not None`, but a
+    # half-loaded Moshi (load() failed midway) would have these unset.
+    # run_wav must error clearly rather than dereferencing None into a
+    # cryptic AttributeError deep in the moshi library.
+    instance = moshi.Moshi(emit=lambda _msg: None)
+    with pytest.raises(RuntimeError, match="not loaded"):
+        instance.run_wav("in.wav", "out.wav")

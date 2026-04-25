@@ -69,6 +69,7 @@ class Moshi(Model):
         # mimi…", "loading to mps…" instead of a silent 60s spinner.
         self._emit = emit
         self._device: Optional[str] = None
+        self._checkpoint: Any = None  # moshi loaders.CheckpointInfo, kept for run_wav
         self._mimi: Any = None
         self._lm: Any = None
         self._text_tokenizer: Any = None
@@ -110,6 +111,9 @@ class Moshi(Model):
             # STEP 2a: resolve the checkpoint descriptor. This hits HF to
             # look up the current revision but does not yet download the
             # big weight files — those happen inside get_mimi/get_moshi.
+            # The descriptor is also kept on self because run_wav needs
+            # its `lm_gen_config` and `model_type` to build an
+            # InferenceState that matches how the model was trained.
             checkpoint = loaders.CheckpointInfo.from_hf_repo(repo)
 
             # STEP 2b: Mimi (audio codec). First thing we need; it's also
@@ -131,14 +135,110 @@ class Moshi(Model):
             self._emit({"event": "model_phase", "phase": "loading_tokenizer"})
             text_tokenizer = checkpoint.get_text_tokenizer()
 
-            return mimi, lm, text_tokenizer
+            return checkpoint, mimi, lm, text_tokenizer
 
-        self._mimi, self._lm, self._text_tokenizer = await asyncio.to_thread(_do_load)
+        (
+            self._checkpoint,
+            self._mimi,
+            self._lm,
+            self._text_tokenizer,
+        ) = await asyncio.to_thread(_do_load)
 
         self._emit({"event": "model_phase", "phase": "ready", "device": self._device})
 
+    def run_wav(self, input_path: str, output_path: str) -> dict:
+        """Offline self-test: run a wav file through the loaded model and
+        write the response to disk. Synchronous and blocking — callers
+        should dispatch via asyncio.to_thread so the worker's control loop
+        stays responsive (a long input clip can take many seconds even
+        on GPU, and we still want the host to be able to send `shutdown`).
+
+        Returns a metadata dict (frames, duration, elapsed) that the IPC
+        handler merges into its reply.
+
+        Wraps moshi.run_inference.InferenceState — the upstream library's
+        own self-test harness — rather than reimplementing the streaming
+        loop here. Reusing it means we track upstream behavior changes
+        (model-type quirks, EOS handling) for free.
+        """
+        if self._mimi is None or self._lm is None or self._checkpoint is None:
+            # Defensive: handler should already gate on `instance is not
+            # None`, but a half-loaded model would have these unset.
+            raise RuntimeError("model not loaded")
+
+        # Imports here, not at module top, mirror the rest of this file:
+        # keep the worker startable even when torch / sphn / moshi-runtime
+        # have issues, surfacing the failure only when generation is
+        # actually attempted.
+        import time
+
+        import sphn
+        import torch
+        from moshi.run_inference import InferenceState, seed_all
+
+        # SETUP: deterministic seeding. Matches upstream's run_inference
+        # so two consecutive run_wav calls with the same input produce
+        # the same output — useful for diffing against a golden file.
+        seed_all(4242)
+
+        # STEP 1: read input wav, resample to mimi's native rate, ship to
+        # the model's device. sphn returns (channels, samples) float32 in
+        # [-1, 1]; we keep just channel 0 because moshi is mono.
+        in_pcms, _ = sphn.read(input_path, sample_rate=self._mimi.sample_rate)
+        in_pcms_t = torch.from_numpy(in_pcms).to(device=self._device)
+        batch_size = 1
+        in_pcms_t = in_pcms_t[None, 0:1].expand(batch_size, -1, -1)
+
+        # STEP 2: build the InferenceState and run. cfg_coef=1.0 disables
+        # classifier-free guidance — moshiko (the default checkpoint)
+        # isn't a CFG-conditioned model, so any other value would just
+        # waste compute. lm_gen_config carries sampling temperatures and
+        # any model-type-specific knobs the checkpoint shipped with.
+        with torch.no_grad():
+            state = InferenceState(
+                self._checkpoint,
+                self._mimi,
+                self._text_tokenizer,
+                self._lm,
+                batch_size,
+                cfg_coef=1.0,
+                device=self._device,
+                **self._checkpoint.lm_gen_config,
+            )
+            t0 = time.time()
+            out_items = state.run(in_pcms_t)
+            elapsed = time.time() - t0
+
+        # STEP 3: handle empty output. Some model_types return [] when
+        # `dep_q == 0` (no audio decoder head). Surface that explicitly
+        # rather than letting the caller find an empty file.
+        if not out_items:
+            return {
+                "frames": 0,
+                "duration_s": 0.0,
+                "elapsed_s": float(elapsed),
+                "device": self._device,
+                "note": "model produced no audio output",
+            }
+
+        # STEP 4: write the (single, since batch_size=1) output wav. sphn
+        # writes float32 PCM; the .numpy() copy is unavoidable because
+        # sphn doesn't accept torch tensors directly.
+        _, out_pcm = out_items[0]
+        sample_rate = self._mimi.sample_rate
+        sphn.write_wav(output_path, out_pcm[0].numpy(), sample_rate=sample_rate)
+
+        return {
+            "frames": int(out_pcm.shape[1]),
+            "duration_s": float(out_pcm.shape[1]) / float(sample_rate),
+            "elapsed_s": float(elapsed),
+            "device": self._device,
+            "sample_rate": int(sample_rate),
+        }
+
     async def unload(self) -> None:
         # Drop references first so Python's GC can reclaim the tensors.
+        self._checkpoint = None
         self._mimi = None
         self._lm = None
         self._text_tokenizer = None

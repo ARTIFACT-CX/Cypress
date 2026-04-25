@@ -133,11 +133,47 @@ async def _handle_shutdown(_msg: dict) -> dict:
     return {"ok": True, "bye": True}
 
 
+async def _handle_run_wav(msg: dict) -> dict:
+    # Offline self-test: feed a wav file through the loaded model and
+    # write the response to disk. Useful for verifying the streaming
+    # pipeline works end-to-end before mic capture is wired in. Path-in,
+    # path-out, metadata reply — no audio streamed back over IPC.
+    instance = _state["instance"]
+    if instance is None:
+        return {"error": "no model loaded"}
+
+    # STEP 1: validate the paths up front so we fail fast rather than
+    # spending ~30s loading audio buffers only to error on a missing key.
+    input_path = msg.get("input")
+    output_path = msg.get("output")
+    if not isinstance(input_path, str) or not input_path:
+        return {"error": "missing or invalid 'input' path"}
+    if not isinstance(output_path, str) or not output_path:
+        return {"error": "missing or invalid 'output' path"}
+
+    # STEP 2: gate on capability rather than model name. run_wav is
+    # currently Moshi-specific — when PersonaPlex (or a TTS backend)
+    # lands without offline self-test support, this hasattr keeps the
+    # handler honest instead of erroring inside torch ops.
+    if not hasattr(instance, "run_wav"):
+        return {"error": f"loaded model {_state['model']!r} does not support run_wav"}
+
+    # STEP 3: run the (blocking) generation off the event loop so the
+    # worker can still react to a shutdown command mid-test if the user
+    # changes their mind on a 2-minute clip.
+    try:
+        info = await asyncio.to_thread(instance.run_wav, input_path, output_path)
+    except Exception as e:
+        return {"error": f"{type(e).__name__}: {e}"}
+    return {"ok": True, **info}
+
+
 _HANDLERS: dict[str, Handler] = {
     "status": _handle_status,
     "load_model": _handle_load_model,
     "unload": _handle_unload,
     "shutdown": _handle_shutdown,
+    "run_wav": _handle_run_wav,
 }
 
 

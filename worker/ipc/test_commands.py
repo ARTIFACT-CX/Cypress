@@ -186,6 +186,90 @@ async def test_unload_surfaces_error():
     assert "RuntimeError" in reply["error"]
 
 
+# --- _handle_run_wav ---------------------------------------------------------
+
+
+class FakeStreamingModel(FakeModel):
+    """FakeModel + a run_wav method so the streaming-handler tests exercise
+    the success path without real torch / moshi."""
+
+    name = "streaming"
+    run_wav_returns: dict | None = None
+    run_wav_should_raise: BaseException | None = None
+    run_wav_calls: list[tuple[str, str]] = []
+
+    def run_wav(self, input_path: str, output_path: str) -> dict:
+        self.run_wav_calls.append((input_path, output_path))
+        if self.run_wav_should_raise is not None:
+            raise self.run_wav_should_raise
+        return self.run_wav_returns or {"frames": 100, "duration_s": 1.0}
+
+
+async def test_run_wav_rejects_when_no_model_loaded():
+    reply = await commands._handle_run_wav({"input": "in.wav", "output": "out.wav"})
+    assert "error" in reply
+    assert "no model" in reply["error"]
+
+
+async def test_run_wav_rejects_missing_input_path():
+    commands._state["instance"] = FakeStreamingModel(emit=lambda _m: None)
+    reply = await commands._handle_run_wav({"output": "out.wav"})
+    assert "error" in reply
+    assert "input" in reply["error"]
+
+
+async def test_run_wav_rejects_missing_output_path():
+    commands._state["instance"] = FakeStreamingModel(emit=lambda _m: None)
+    reply = await commands._handle_run_wav({"input": "in.wav"})
+    assert "error" in reply
+    assert "output" in reply["error"]
+
+
+async def test_run_wav_rejects_empty_paths():
+    commands._state["instance"] = FakeStreamingModel(emit=lambda _m: None)
+    reply = await commands._handle_run_wav({"input": "", "output": "out.wav"})
+    assert "error" in reply
+
+
+async def test_run_wav_rejects_when_model_lacks_capability():
+    # FakeModel (without run_wav) must not be silently accepted — the
+    # handler's hasattr gate is what keeps a future TTS-only model from
+    # crashing inside torch.
+    commands._state["model"] = "fake"
+    commands._state["instance"] = FakeModel(emit=lambda _m: None)
+    reply = await commands._handle_run_wav({"input": "in.wav", "output": "out.wav"})
+    assert "error" in reply
+    assert "run_wav" in reply["error"]
+
+
+async def test_run_wav_success_returns_metadata():
+    fake = FakeStreamingModel(emit=lambda _m: None)
+    fake.run_wav_returns = {"frames": 24000, "duration_s": 1.0, "device": "mps"}
+    commands._state["instance"] = fake
+
+    reply = await commands._handle_run_wav({"input": "in.wav", "output": "out.wav"})
+
+    assert reply["ok"] is True
+    assert reply["frames"] == 24000
+    assert reply["device"] == "mps"
+    # Confirm the handler actually invoked the model with the paths it
+    # received — easy to break if the kwargs get re-shuffled.
+    assert fake.run_wav_calls[-1] == ("in.wav", "out.wav")
+
+
+async def test_run_wav_surfaces_model_exception_with_type():
+    fake = FakeStreamingModel(emit=lambda _m: None)
+    fake.run_wav_should_raise = FileNotFoundError("in.wav: no such file")
+    commands._state["instance"] = fake
+
+    reply = await commands._handle_run_wav({"input": "in.wav", "output": "out.wav"})
+
+    assert "error" in reply
+    # Type prefix matters — the host UI surfaces it directly, and "permission
+    # denied" reads very differently from "FileNotFoundError".
+    assert "FileNotFoundError" in reply["error"]
+
+
 # --- emit_event --------------------------------------------------------------
 
 
