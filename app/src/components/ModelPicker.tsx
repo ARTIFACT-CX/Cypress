@@ -42,11 +42,16 @@ type Status = {
 // Human-readable mapping for phase strings emitted by the worker. Unknown
 // phases fall back to the raw string, so new worker-side phases show up
 // in the UI without requiring a frontend change.
+// Phases are loading_* rather than downloading_* because HuggingFace's
+// hub client transparently uses its on-disk cache after the first run —
+// the worker can't easily tell "fetched bytes" from "loaded from cache",
+// and saying "Downloading…" on every launch was misleading. The
+// language-model phase still calls out the first-run cost so a fresh
+// install isn't mistaken for a hung load.
 const PHASE_LABELS: Record<string, string> = {
   resolving: "Resolving checkpoint…",
-  downloading_mimi: "Downloading audio codec…",
-  downloading_lm:
-    "Downloading language model… (first run only — can take several minutes)",
+  loading_mimi: "Loading audio codec…",
+  loading_lm: "Loading language model… (first run downloads several GB)",
   loading_tokenizer: "Loading text tokenizer…",
   ready: "Finishing up…",
 };

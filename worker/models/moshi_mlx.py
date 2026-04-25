@@ -26,7 +26,6 @@ faster, more quality cost).
 """
 
 import asyncio
-import json
 import os
 from typing import Any, Callable, Optional
 
@@ -92,18 +91,23 @@ class MoshiMlx(Model):
             import sentencepiece
             from moshi_mlx import models
 
-            # STEP 2a: pull config first so we know which weight files
-            # this checkpoint variant uses (mimi name, tokenizer name,
-            # and the moshi weights filename, which encodes the
-            # quantization scheme: model.q8.safetensors etc.).
-            config_path = hf_hub_download(repo, "config.json")
-            with open(config_path) as f:
-                lm_config_dict = json.load(f)
-            mimi_name = lm_config_dict["mimi_name"]
-            tokenizer_name = lm_config_dict["tokenizer_name"]
-            moshi_name = lm_config_dict.get("moshi_name", "model.safetensors")
+            # File names are fixed across the published moshiko-mlx-*
+            # repos (q4 / q8 / bf16). The quantization variant is
+            # encoded in the moshi weights filename suffix; mimi and
+            # tokenizer files are identical across variants. No JSON
+            # config — the config is built from code (config_v0_1)
+            # because these checkpoints predate kyutai's per-repo
+            # config.json convention.
+            mimi_name = "tokenizer-e351c8d8-checkpoint125.safetensors"
+            tokenizer_name = "tokenizer_spm_32k_3.model"
+            if "q4" in repo:
+                moshi_name = "model.q4.safetensors"
+            elif "q8" in repo:
+                moshi_name = "model.q8.safetensors"
+            else:
+                moshi_name = "model.safetensors"
 
-            # STEP 2b: download (cache-friendly). HF hub silently uses
+            # STEP 2a: download (cache-friendly). HF hub silently uses
             # ~/.cache/huggingface/hub on subsequent runs, so most loads
             # reach this code with nothing to download.
             self._emit({"event": "model_phase", "phase": "loading_lm"})
@@ -113,12 +117,14 @@ class MoshiMlx(Model):
             self._emit({"event": "model_phase", "phase": "loading_tokenizer"})
             tokenizer_path = hf_hub_download(repo, tokenizer_name)
 
-            # STEP 2c: build the LM. Set bf16 base dtype, then quantize
-            # if the weight filename signals a quantized variant. Group
-            # sizes follow the upstream `local.py` defaults — these are
-            # what the published weights were quantized at, so any other
-            # value here would mismatch and produce garbage.
-            lm_config = models.LmConfig.from_config_dict(lm_config_dict)
+            # STEP 2b: build the LM. config_v0_1 matches what the
+            # moshiko-mlx-* checkpoints were trained against (8
+            # generated codebooks, 8 other codebooks, etc.). Set bf16
+            # base dtype, then quantize if the filename signals it.
+            # Group sizes follow upstream local.py defaults — these are
+            # what the published weights were quantized at, so any
+            # other value would mismatch and produce garbage.
+            lm_config = models.config_v0_1()
             model = models.Lm(lm_config)
             model.set_dtype(mx.bfloat16)
             if moshi_weights.endswith(".q4.safetensors"):
@@ -127,24 +133,31 @@ class MoshiMlx(Model):
                 nn.quantize(model, bits=8, group_size=64)
             model.load_weights(moshi_weights, strict=True)
 
-            # STEP 2d: condition tensor. Some Moshi variants are trained
-            # with a conditioning scheme ("very_good" description, etc.);
-            # others have no conditioner and we pass None through to step.
+            # STEP 2c: condition tensor. moshiko has no conditioner —
+            # the attribute is checked defensively in case a future
+            # repo we point CYPRESS_MOSHI_REPO at does.
             ct = None
-            if model.condition_provider is not None:
+            if getattr(model, "condition_provider", None) is not None:
                 ct = model.condition_provider.condition_tensor(
                     "description", "very_good"
                 )
 
-            # STEP 2e: warmup. MLX compiles kernels on first use; doing
-            # it here means the streaming session's first frame doesn't
-            # eat a multi-second JIT hit. Cheap (sub-second on q8).
-            model.warmup(ct)
+            # STEP 2d: warmup. MLX compiles kernels on first use;
+            # doing it here means the streaming session's first frame
+            # doesn't eat a multi-second JIT hit. Cheap (sub-second
+            # on q8). Pass `ct` if the model takes one — moshiko's
+            # warmup ignores the arg.
+            try:
+                model.warmup(ct)
+            except TypeError:
+                # Some upstream versions don't accept the condition
+                # arg; fall back to plain warmup.
+                model.warmup()
 
-            # STEP 2f: rustymimi tokenizer (Rust streaming codec). We
-            # build it sized for `max(generated, other)` codebooks so it
-            # covers both encode and decode paths. encode_step /
-            # decode_step are streaming and stateful.
+            # STEP 2e: rustymimi tokenizer (Rust streaming codec).
+            # Sized for max(generated, other) so it covers both
+            # encode and decode paths. encode_step / decode_step are
+            # stateful and streaming.
             generated_codebooks = lm_config.generated_codebooks
             other_codebooks = lm_config.other_codebooks
             mimi_codebooks = max(generated_codebooks, other_codebooks)
@@ -152,8 +165,8 @@ class MoshiMlx(Model):
                 mimi_weights, num_codebooks=mimi_codebooks
             )
 
-            # STEP 2g: text tokenizer (SentencePiece). Used to render the
-            # inner-monologue token stream into readable text.
+            # STEP 2f: text tokenizer (SentencePiece). Used to render
+            # the inner-monologue token stream into readable text.
             text_tokenizer = sentencepiece.SentencePieceProcessor(tokenizer_path)
 
             return (

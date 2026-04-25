@@ -196,3 +196,5 @@ Don't create README, design docs, or summary markdown files unless explicitly as
 ### Track progress on GitHub issues
 
 When work maps to an existing GitHub issue, post a progress comment on that issue as commits land — list the relevant commit SHAs and a short note on what's done vs still pending. Don't close the issue until it's actually finished end-to-end. Use `gh issue comment <n>` for the updates and `gh issue view <n>` first to confirm scope before commenting.
+
+When *creating* a new issue, also add it to the Cypress project board so it shows up on the roadmap — milestones alone don't surface there. After `gh issue create` returns the URL, run `gh project item-add 3 --owner ARTIFACT-CX --url <url>`.

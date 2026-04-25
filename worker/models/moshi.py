@@ -121,17 +121,24 @@ class Moshi(Model):
             # InferenceState that matches how the model was trained.
             checkpoint = loaders.CheckpointInfo.from_hf_repo(repo)
 
+            # Phase names are "loading_*" rather than "downloading_*" —
+            # HF's hub client silently uses its on-disk cache after the
+            # first run, so most launches reach this code with nothing
+            # actually being downloaded. The UI still calls out the
+            # first-run cost on the LM phase so a fresh install isn't
+            # mistaken for a hung load.
+
             # STEP 2b: Mimi (audio codec). First thing we need; it's also
             # the smallest (~100MB) so this phase completes quickly and
             # gives the user visible progress that *something* is moving.
-            self._emit({"event": "model_phase", "phase": "downloading_mimi"})
+            self._emit({"event": "model_phase", "phase": "loading_mimi"})
             mimi = checkpoint.get_mimi(device=self._device)
 
             # STEP 2c: Moshi LM (~7B). This is the slow one — several GB
             # to pull on first run, then several seconds to move to MPS/
             # CUDA. Subsequent loads hit the HF cache and skip straight
             # to the device transfer.
-            self._emit({"event": "model_phase", "phase": "downloading_lm"})
+            self._emit({"event": "model_phase", "phase": "loading_lm"})
             lm = checkpoint.get_moshi(device=self._device)
 
             # STEP 2d: text tokenizer (SentencePiece, ~1MB). Needed to

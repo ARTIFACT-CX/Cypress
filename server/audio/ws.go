@@ -35,11 +35,14 @@ import (
 	"github.com/coder/websocket"
 )
 
-// readTimeout caps how long a ReadFrame call may park. Long pauses are
-// expected in voice (silence between utterances) so this is generous;
-// it's only here to surface a wedged client / NAT timeout instead of
-// hanging indefinitely. Tune once we have real session traces.
-const readTimeout = 5 * time.Minute
+// readTimeout caps how long a ReadFrame call may park. Voice sessions
+// have legitimately quiet stretches — a paused user, or (especially on
+// CPU/MPS bf16) the client waiting for the model to catch up — so this
+// has to outlast any plausible silence. The proper fix is a WS ping/
+// pong heartbeat that detects wedged clients without forcing them to
+// send audio; until then, a generous deadline keeps the pipeline alive.
+// TODO: replace with ping/pong keepalive (#TBD).
+const readTimeout = 30 * time.Minute
 
 // writeTimeout bounds individual WS sends. Per-frame, not per-session.
 // A slow client pegging this triggers a connection drop, which is the

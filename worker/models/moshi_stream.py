@@ -174,6 +174,21 @@ class MoshiStream:
                 # we're throwing the session away anyway.
                 pass
 
+        # SAFETY: streaming_forever() enters mimi/lm_gen's streaming context
+        # without ever exiting it (it just calls __enter__ on the manager).
+        # If we don't stop streaming explicitly, the *next* session's
+        # streaming_forever() trips the upstream "is already streaming"
+        # assertion. _stop_streaming clears _streaming_state on the module
+        # tree so the next session can re-enter cleanly.
+        try:
+            self._c.mimi._stop_streaming()
+        except Exception:
+            pass
+        try:
+            self._c.lm_gen._stop_streaming()
+        except Exception:
+            pass
+
     async def _run(self) -> None:
         """Generation worker. Runs until it sees _INPUT_EOF or is
         cancelled. Per frame: encode PCM → step LM → decode emitted

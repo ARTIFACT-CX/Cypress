@@ -1,3 +1,9 @@
+# Local testing scripts + fixtures (smoke tests, sample audio, throwaway
+# repro snippets). Anything reusable graduates into a feature folder.
+# README.md is the one tracked file so contributors know what lives here.
+scripts/*
+!scripts/README.md
+
 # Dependencies
 node_modules/
 

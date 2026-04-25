@@ -284,8 +284,17 @@ async def _stop_active_stream() -> None:
     to avoid leaking sessions across model swaps."""
     session = _state["stream"]
     drain = _state["stream_drain"]
-    _state["stream"] = None
-    _state["stream_drain"] = None
+    if session is None and drain is None:
+        return
+
+    # SAFETY: do NOT clear _state["stream"] before aclose() returns. On a
+    # busy worker (e.g. mid-_step), aclose can take seconds while it waits
+    # for the model thread to wind up — and during that window a new
+    # start_stream would race in, see no active stream, and call
+    # mimi.streaming_forever() while mimi is still in streaming state from
+    # this session. That trips the upstream "is already streaming"
+    # assertion. Clearing only after aclose+_stop_streaming have run keeps
+    # the streaming-state machine consistent with our own bookkeeping.
     if session is not None:
         try:
             await session.aclose()
@@ -302,6 +311,9 @@ async def _stop_active_stream() -> None:
             await drain
         except (asyncio.CancelledError, Exception):
             pass
+
+    _state["stream"] = None
+    _state["stream_drain"] = None
 
 
 _HANDLERS: dict[str, Handler] = {
