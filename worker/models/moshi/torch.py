@@ -24,8 +24,8 @@ import asyncio
 import os
 from typing import Any, Callable, Optional
 
-from .base import Model, register
-from .moshi_stream import MoshiStream, _StreamComponents
+from ..base import Model, register
+from .torch_stream import MoshiStream, _StreamComponents
 
 
 # SETUP: which HF repo we pull from. Defaults to the bf16 moshiko variant

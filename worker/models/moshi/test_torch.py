@@ -12,7 +12,7 @@ import types
 
 import pytest
 
-from . import moshi
+from . import torch as moshi
 
 
 def _fake_torch(mps_available: bool, cuda_available: bool) -> types.SimpleNamespace:
@@ -56,7 +56,7 @@ def test_moshi_torch_registered_under_explicit_name():
     # Loose smoke check that the @register decorator wired the class in
     # under the explicit backend name. The autoselect alias `"moshi"` is
     # platform-dependent and tested separately.
-    from . import REGISTRY
+    from .. import REGISTRY
 
     assert "moshi-torch" in REGISTRY
     assert REGISTRY["moshi-torch"] is moshi.Moshi
@@ -66,7 +66,7 @@ def test_moshi_alias_resolves_to_one_of_the_backends():
     # `"moshi"` is an alias chosen at import time by __init__.py based on
     # platform / env override. Either backend is a valid resolution — we
     # just want to confirm the alias exists and points at a real class.
-    from . import REGISTRY
+    from .. import REGISTRY
 
     assert "moshi" in REGISTRY
     assert REGISTRY["moshi"] in (REGISTRY["moshi-torch"], REGISTRY["moshi-mlx"])

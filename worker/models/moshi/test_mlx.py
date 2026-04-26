@@ -18,12 +18,12 @@ import asyncio
 
 import pytest
 
-from . import moshi_mlx
-from .moshi_mlx_stream import MoshiMlxStream, _StreamComponents, StreamChunk
+from . import mlx as moshi_mlx
+from .mlx_stream import MoshiMlxStream, _StreamComponents, StreamChunk
 
 
 def test_moshi_mlx_registered_under_explicit_name():
-    from . import REGISTRY
+    from .. import REGISTRY
 
     assert "moshi-mlx" in REGISTRY
     assert REGISTRY["moshi-mlx"] is moshi_mlx.MoshiMlx

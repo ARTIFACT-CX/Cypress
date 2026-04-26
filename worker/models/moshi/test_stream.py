@@ -11,7 +11,7 @@ import asyncio
 import pytest
 import torch
 
-from .moshi_stream import (
+from .torch_stream import (
     MoshiStream,
     StreamChunk,
     _StreamComponents,

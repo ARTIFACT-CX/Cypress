@@ -29,8 +29,8 @@ import asyncio
 import os
 from typing import Any, Callable, Optional
 
-from .base import Model, register
-from .moshi_mlx_stream import MoshiMlxStream, _StreamComponents
+from ..base import Model, register
+from .mlx_stream import MoshiMlxStream, _StreamComponents
 
 
 DEFAULT_REPO = "kyutai/moshiko-mlx-q8"
