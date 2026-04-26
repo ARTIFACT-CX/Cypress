@@ -110,6 +110,7 @@ type ServerStore = {
   stopServer: () => Promise<void>;
   loadModel: (name: string) => Promise<void>;
   downloadModel: (name: string) => Promise<void>;
+  cancelDownload: (name: string) => Promise<void>;
   deleteModel: (name: string) => Promise<void>;
 };
 
@@ -212,6 +213,23 @@ export const useServerStore = create<ServerStore>((set, get) => ({
       set({ models: after });
       throw new Error(body.error || `HTTP ${res.status}`);
     }
+  },
+  cancelDownload: async (name) => {
+    const res = await fetch(
+      `${SERVER_URL}/models/${encodeURIComponent(name)}/download`,
+      { method: "DELETE" },
+    );
+    if (!res.ok) {
+      const body = await res.json().catch(() => ({}));
+      throw new Error(body.error || `HTTP ${res.status}`);
+    }
+    // Optimistic clear so the row reverts to "Download" before the next
+    // /models poll lands. The server-side slot is cleared via the
+    // download_error("cancelled") event the worker emits on its way out.
+    const after = get().models.map((m) =>
+      m.name === name ? { ...m, download: undefined } : m,
+    );
+    set({ models: after });
   },
   deleteModel: async (name) => {
     const res = await fetch(

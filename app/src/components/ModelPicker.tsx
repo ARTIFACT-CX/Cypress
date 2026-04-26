@@ -8,7 +8,7 @@
 // download is active) — see store/bootstrap.ts.
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Check, Download, Loader2, MoreHorizontal, Play, Trash2 } from "lucide-react";
+import { Check, Download, Loader2, MoreHorizontal, Play, Trash2, X } from "lucide-react";
 import {
   selectIsRunning,
   type DownloadProgress,
@@ -42,40 +42,37 @@ function formatBytes(n: number): string {
   return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)} ${units[i]}`;
 }
 
-// Render the per-row download bar. Lives as its own component so the
-// model-row JSX stays scannable. Indeterminate (animated) when total
-// is unknown; determinate fill when we have HF's metadata.
-function DownloadBar({ d }: { d: DownloadProgress }) {
+// Thin progress strip pinned flush to the bottom edge of the row card.
+// No track — the row's own border frames the fill, so the bar reads as
+// part of the card rather than a separate widget. Indeterminate (animated)
+// when HF didn't return a total; determinate fill otherwise.
+function RowProgressBar({ d }: { d: DownloadProgress }) {
   const known = d.total > 0;
   const pct = known
     ? Math.min(100, Math.max(0, (d.downloaded / d.total) * 100))
     : 0;
-  const label =
-    d.phase === "starting"
-      ? "Preparing…"
-      : known
-        ? `${formatBytes(d.downloaded)} / ${formatBytes(d.total)}`
-        : `Downloading ${d.fileIndex + 1}/${d.fileCount}…`;
   return (
-    <div className="mt-1 w-full">
-      <div className="mb-0.5 flex items-center justify-between text-[10px] tabular-nums text-muted-foreground">
-        <span className="truncate">{d.file || "preparing"}</span>
-        <span>{label}</span>
-      </div>
-      <div className="relative h-1 w-full overflow-hidden rounded bg-secondary">
-        {known ? (
-          <div
-            className="absolute inset-y-0 left-0 bg-primary transition-[width] duration-300"
-            style={{ width: `${pct}%` }}
-          />
-        ) : (
-          // SWAP: indeterminate stripe. Tailwind's animate-pulse gives a
-          // subtle "working" cue without us shipping a custom keyframe.
-          <div className="absolute inset-y-0 left-0 w-1/3 animate-pulse bg-primary/60" />
-        )}
-      </div>
+    <div className="absolute inset-x-0 bottom-0 h-0.5 bg-white/10">
+      {known ? (
+        <div
+          className="h-full bg-white transition-[width] duration-300"
+          style={{ width: `${pct}%` }}
+        />
+      ) : (
+        <div className="h-full w-1/3 animate-pulse bg-white/80" />
+      )}
     </div>
   );
+}
+
+// Compact byte/file label shown next to the "Downloading…" action so
+// the user gets numbers without a second row of text.
+function downloadLabel(d: DownloadProgress): string {
+  if (d.phase === "starting") return "Preparing…";
+  if (d.total > 0) {
+    return `${formatBytes(d.downloaded)} / ${formatBytes(d.total)}`;
+  }
+  return `${d.fileIndex + 1}/${d.fileCount}`;
 }
 
 // Tiny popover menu anchored to the "more actions" button. Rolled
@@ -136,6 +133,7 @@ function ModelRow({
   serverUp,
   onLoad,
   onDownload,
+  onCancelDownload,
   onDelete,
 }: {
   m: ModelInfo;
@@ -145,6 +143,7 @@ function ModelRow({
   serverUp: boolean;
   onLoad: (n: string) => void;
   onDownload: (n: string) => void;
+  onCancelDownload: (n: string) => void;
   onDelete: (n: string) => void;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
@@ -157,12 +156,21 @@ function ModelRow({
   //   missing weights → Download
   //   weights present → Load
   let primary: React.ReactNode;
-  if (downloading) {
+  if (downloading && m.download) {
     primary = (
-      <span className="flex items-center gap-1 text-muted-foreground">
-        <Loader2 className="h-3 w-3 animate-spin" />
-        <span>Downloading…</span>
-      </span>
+      <div className="flex items-center gap-1.5 text-muted-foreground">
+        <span className="tabular-nums text-[10px]">
+          {downloadLabel(m.download)}
+        </span>
+        <button
+          type="button"
+          onClick={() => onCancelDownload(m.name)}
+          aria-label={`Cancel download of ${m.label}`}
+          className="rounded p-0.5 hover:bg-accent hover:text-foreground"
+        >
+          <X className="h-3 w-3" />
+        </button>
+      </div>
     );
   } else if (isActive) {
     primary = (
@@ -209,7 +217,7 @@ function ModelRow({
 
   return (
     <div
-      className={`flex flex-col rounded border px-2 py-1.5 transition-colors ${
+      className={`relative flex flex-col overflow-hidden rounded border px-2 py-1.5 transition-colors ${
         isActive
           ? "border-primary/40 bg-primary/5"
           : m.available
@@ -273,7 +281,9 @@ function ModelRow({
           )}
         </div>
       </div>
-      {m.download && <DownloadBar d={m.download} />}
+      {m.download && m.download.phase !== "error" && (
+        <RowProgressBar d={m.download} />
+      )}
       {downloadError && (
         <div className="mt-1 text-[10px] text-red-400">
           Download failed: {downloadError}
@@ -289,6 +299,7 @@ export function ModelPicker() {
   const pending = useServerStore((s) => s.pendingModel);
   const loadModel = useServerStore((s) => s.loadModel);
   const downloadModel = useServerStore((s) => s.downloadModel);
+  const cancelDownload = useServerStore((s) => s.cancelDownload);
   const deleteModel = useServerStore((s) => s.deleteModel);
   const models = useServerStore((s) => s.models);
 
@@ -343,6 +354,22 @@ export function ModelPicker() {
     [submitting, requireServer, downloadModel],
   );
 
+  const onCancelDownload = useCallback(
+    async (name: string) => {
+      // Cancel runs even if another action is in flight — it's the user
+      // bailing out, and blocking it on submitting state would feel
+      // unresponsive.
+      if (!requireServer()) return;
+      setError(null);
+      try {
+        await cancelDownload(name);
+      } catch (e) {
+        setError(e instanceof Error ? e.message : String(e));
+      }
+    },
+    [requireServer, cancelDownload],
+  );
+
   // Delete confirmation is handled by the row's overflow menu —
   // opening the menu and clicking the explicit Delete item is itself
   // a deliberate two-step, so no extra JS confirm needed here.
@@ -378,7 +405,7 @@ export function ModelPicker() {
       : null;
 
   return (
-    <div className="fixed bottom-4 left-4 flex w-80 max-w-[90vw] flex-col gap-2 rounded-md border bg-card/80 p-3 text-xs backdrop-blur">
+    <div className="fixed bottom-4 left-4 flex w-[22rem] max-w-[90vw] flex-col gap-2 rounded-md border bg-card/80 p-3 text-xs backdrop-blur">
       <div className="font-medium text-foreground">Models</div>
       <div className="flex flex-col gap-1.5">
         {models.length === 0 && serverUp && (
@@ -401,6 +428,7 @@ export function ModelPicker() {
               serverUp={serverUp}
               onLoad={onLoad}
               onDownload={onDownload}
+              onCancelDownload={onCancelDownload}
               onDelete={onDelete}
             />
           );

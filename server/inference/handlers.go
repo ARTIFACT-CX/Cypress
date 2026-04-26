@@ -52,6 +52,20 @@ func RegisterRoutes(mux *http.ServeMux, mgr *Manager) {
 		writeJSON(w, http.StatusAccepted, map[string]any{"ok": true, "name": name})
 	})
 
+	mux.HandleFunc("DELETE /models/{name}/download", func(w http.ResponseWriter, r *http.Request) {
+		name := r.PathValue("name")
+		if name == "" {
+			http.Error(w, "missing name", http.StatusBadRequest)
+			return
+		}
+		if err := mgr.CancelDownload(name); err != nil {
+			log.Printf("cancel_download %q rejected: %v", name, err)
+			writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "name": name})
+	})
+
 	mux.HandleFunc("DELETE /models/{name}", func(w http.ResponseWriter, r *http.Request) {
 		name := r.PathValue("name")
 		if name == "" {

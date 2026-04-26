@@ -179,13 +179,49 @@ func (m *Manager) handleDownloadEvent(event string, msg map[string]any) {
 		delete(m.inflightDownloads, name)
 		m.mu.Unlock()
 	case "download_error":
+		errMsg := stringField(msg, "error")
 		m.mu.Lock()
-		m.inflightDownloads[name] = &DownloadProgress{
-			Phase: "error",
-			Error: stringField(msg, "error"),
+		// REASON: cancellation surfaces as an error event from the worker
+		// but the user already knows it happened — clear the slot so the
+		// row reverts to "Download" instead of showing a stuck error.
+		if errMsg == "cancelled" {
+			delete(m.inflightDownloads, name)
+		} else {
+			m.inflightDownloads[name] = &DownloadProgress{
+				Phase: "error",
+				Error: errMsg,
+			}
 		}
 		m.mu.Unlock()
 	}
+}
+
+// CancelDownload asks the worker to abort the in-flight pull. The
+// worker emits a download_error("cancelled") on its way out, which
+// handleDownloadEvent translates into a slot-clear. .incomplete blobs
+// stay on disk so a retry resumes via HF's Range-aware fetch.
+func (m *Manager) CancelDownload(name string) error {
+	m.mu.Lock()
+	w := m.worker
+	_, inflight := m.inflightDownloads[name]
+	m.mu.Unlock()
+	if !inflight {
+		return errors.New("no download in progress for this model")
+	}
+	if w == nil {
+		// Inflight slot exists but no worker — shouldn't happen, but
+		// drop the slot so the UI recovers either way.
+		m.mu.Lock()
+		delete(m.inflightDownloads, name)
+		m.mu.Unlock()
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := w.send(ctx, "cancel_download", map[string]any{"name": name}); err != nil {
+		return fmt.Errorf("worker cancel rejected: %w", err)
+	}
+	return nil
 }
 
 // DeleteModel removes an installed model from disk and the manifest.
