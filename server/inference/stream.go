@@ -133,9 +133,13 @@ func (s *Stream) receive(out StreamOutput) {
 // --- Manager additions -------------------------------------------------------
 
 // StartStream opens a streaming session against the loaded model.
-// Returns an error if no model is loaded, the model doesn't support
-// streaming, or another session is already active. The returned Stream
-// owns the IPC channel until its Close runs.
+// Returns an error if no model is loaded or the model doesn't support
+// streaming. If a previous session is still tearing down (its Close is
+// in flight, e.g. the user clicked End-then-Start fast enough that the
+// worker's aclose hasn't finished), we preempt it here rather than
+// rejecting — a fresh user gesture should always win over a session
+// the client already abandoned. The returned Stream owns the IPC
+// channel until its Close runs.
 func (m *Manager) StartStream(ctx context.Context) (*Stream, error) {
 	m.mu.Lock()
 	if m.state != StateServing {
@@ -143,12 +147,19 @@ func (m *Manager) StartStream(ctx context.Context) (*Stream, error) {
 		m.mu.Unlock()
 		return nil, fmt.Errorf("cannot stream: state=%s (need %s)", state, StateServing)
 	}
-	if m.activeStream != nil {
-		m.mu.Unlock()
-		return nil, errors.New("stream already active")
-	}
+	prev := m.activeStream
 	w := m.worker
 	m.mu.Unlock()
+
+	// REASON: preempt rather than reject. The previous session's Close
+	// blocks on a stop_stream IPC roundtrip (worker's aclose can take a
+	// beat to wind up the model thread). Without this, a fast End→Start
+	// from the UI lands in StartStream while activeStream is still set,
+	// and the user gets "stream already active" for what should be a
+	// natural reconnect. Close is idempotent + safe from any goroutine.
+	if prev != nil {
+		_ = prev.Close(ctx)
+	}
 
 	if w == nil {
 		return nil, errors.New("no worker")
@@ -180,7 +191,7 @@ func (m *Manager) StartStream(ctx context.Context) (*Stream, error) {
 	if m.activeStream != nil {
 		m.mu.Unlock()
 		_, _ = w.send(ctx, "stop_stream", nil)
-		return nil, errors.New("stream already active")
+		return nil, errors.New("stream slot taken by concurrent caller")
 	}
 	m.activeStream = s
 	m.mu.Unlock()

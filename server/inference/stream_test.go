@@ -81,9 +81,12 @@ func TestManager_StartStream_SendsStartStreamCmd(t *testing.T) {
 	}
 }
 
-func TestManager_StartStream_RejectsSecondConcurrent(t *testing.T) {
-	// The worker only allows one session at a time. Manager enforces it
-	// at its level too so the WS handler doesn't have to coordinate.
+func TestManager_StartStream_PreemptsPreviousSession(t *testing.T) {
+	// A second StartStream while the first is still active should evict
+	// the first rather than reject. End→Start clicks land here on the
+	// happy path: the previous Close is in-flight (worker aclose waiting
+	// on the model thread) and the user shouldn't see "already active"
+	// for what is from their POV a clean reconnect.
 	fake := &fakeWorker{}
 	m := servingManager(t, fake)
 
@@ -91,10 +94,23 @@ func TestManager_StartStream_RejectsSecondConcurrent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("first StartStream: %v", err)
 	}
-	defer first.Close(context.Background())
 
-	if _, err := m.StartStream(context.Background()); err == nil {
-		t.Fatal("second StartStream: want error, got nil")
+	second, err := m.StartStream(context.Background())
+	if err != nil {
+		t.Fatalf("second StartStream: want preempt, got error: %v", err)
+	}
+	defer second.Close(context.Background())
+
+	// First should be closed (Outputs channel ranges to completion) so
+	// any consumer of the old session exits cleanly instead of dangling.
+	select {
+	case _, ok := <-first.Outputs():
+		if ok {
+			// Drain any in-flight output, then expect closure.
+			<-first.Outputs()
+		}
+	default:
+		// Channel may already be closed; that's fine.
 	}
 }
 

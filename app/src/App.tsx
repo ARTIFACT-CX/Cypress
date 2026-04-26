@@ -1,10 +1,21 @@
 import logo from "./assets/logo.png";
 import { ModelPicker } from "./components/ModelPicker";
 import { ServerControl } from "./components/ServerControl";
+import { VoiceButton } from "./components/VoiceButton";
 import { useChromaticAberration } from "./hooks/useChromaticAberration";
+import { useVoiceSession } from "./hooks/useVoiceSession";
 
 function App() {
-  const logoRef = useChromaticAberration<HTMLImageElement>();
+  const [logoRef, setLogoAudio] = useChromaticAberration<HTMLImageElement>();
+  // Hoist the voice session up so the page chrome (tagline, logo
+  // chromatic-aberration animation) can react to live state without
+  // VoiceButton having to publish anything externally.
+  const voice = useVoiceSession();
+  const live = voice.state === "live" || voice.state === "connecting";
+  // Pump audio level + live flag into the logo effect. While live, the
+  // hook ignores mouse and reacts only to audio (silent → no effect).
+  // While not live, it falls back to the original mouse-reactive mode.
+  setLogoAudio(Math.max(voice.micLevel, voice.playbackLevel), live);
   return (
     <>
       <div data-tauri-drag-region className="titlebar-drag" />
@@ -13,12 +24,17 @@ function App() {
         <h1 className="text-2xl font-medium tracking-tight text-foreground">
           Cypress
         </h1>
-        <p className="text-sm text-muted-foreground">
-          Local voice inference, on your machine.
-        </p>
+        {/* Tagline gives way to the conversation UX once the user
+            starts a session — the transcript becomes the focal copy. */}
+        {!live && (
+          <p className="text-sm text-muted-foreground">
+            Local voice inference, on your machine.
+          </p>
+        )}
       </main>
       <ModelPicker />
       <ServerControl />
+      <VoiceButton voice={voice} />
     </>
   );
 }

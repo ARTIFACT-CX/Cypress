@@ -35,11 +35,14 @@
   filter:
     drop-shadow(
       calc(var(--ca-dx) * -1px) calc(var(--ca-dy) * -1px)
-      calc(var(--ca-blur) * 1px) rgba(255, 0, 80, 0.7)
+      calc(var(--ca-blur) * 1px) rgba(255, 0, 80, 0.85)
     )
     drop-shadow(
       calc(var(--ca-dx) * 1px) calc(var(--ca-dy) * 1px)
-      calc(var(--ca-blur) * 1px) rgba(0, 200, 255, 0.7)
+      calc(var(--ca-blur) * 1px) rgba(0, 200, 255, 0.85)
     );
-  transition: filter 80ms linear;
+  /* Short transition so the visual stays snappy with the rAF tick
+     instead of lagging — the JS already updates ~60Hz. */
+  transition: filter 60ms linear;
+  will-change: filter;
 }
