@@ -55,6 +55,22 @@ const EMPTY_SNAPSHOT: InferenceSnapshot = {
   phase: "",
 };
 
+// Catalog row mirrored from server/inference/catalog.go's ModelInfo.
+// Refreshed on a slow timer alongside the inference snapshot so the
+// "downloaded" badge updates after a successful load without forcing
+// a manual reload.
+export type ModelInfo = {
+  name: string;
+  label: string;
+  hint: string;
+  backend: string;
+  repo: string;
+  sizeGb: string;
+  requirements: string;
+  available: boolean;
+  downloaded: boolean;
+};
+
 type ServerStore = {
   status: ServerStatus;
   inference: InferenceSnapshot;
@@ -63,11 +79,16 @@ type ServerStore = {
   // fast-cadence mode until the requested model is actually serving,
   // and lets ModelPicker show "loading…" without local state.
   pendingModel: string | null;
+  // Static catalog + dynamic download status. Populated once on first
+  // /models fetch and refreshed when the inference state changes
+  // (e.g. a load completing flips a model's downloaded flag).
+  models: ModelInfo[];
 
   // --- internal setters used by bootstrap + actions -------------------
   setStatus: (s: ServerStatus) => void;
   setInference: (s: InferenceSnapshot) => void;
   setPendingModel: (name: string | null) => void;
+  setModels: (m: ModelInfo[]) => void;
 
   // --- actions --------------------------------------------------------
   startServer: () => Promise<void>;
@@ -79,6 +100,7 @@ export const useServerStore = create<ServerStore>((set, get) => ({
   status: { state: "idle" },
   inference: EMPTY_SNAPSHOT,
   pendingModel: null,
+  models: [],
 
   setStatus: (status) => {
     set({ status });
@@ -87,7 +109,7 @@ export const useServerStore = create<ServerStore>((set, get) => ({
     // showing "Moshi serving" from before. Same idea handled in the
     // old ModelPicker via a separate effect.
     if (status.state !== "running") {
-      set({ inference: EMPTY_SNAPSHOT, pendingModel: null });
+      set({ inference: EMPTY_SNAPSHOT, pendingModel: null, models: [] });
     }
   },
   setInference: (inference) => {
@@ -108,6 +130,7 @@ export const useServerStore = create<ServerStore>((set, get) => ({
     set({ inference });
   },
   setPendingModel: (pendingModel) => set({ pendingModel }),
+  setModels: (models) => set({ models }),
 
   startServer: async () => {
     await invoke("start_server");

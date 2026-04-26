@@ -5,20 +5,13 @@
 // the load progress automatically.
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { Check, Download } from "lucide-react";
 import {
   selectIsRunning,
   type InferenceState,
   useServerStore,
 } from "../store/serverStore";
 import { useToast } from "./Toast";
-
-// SWAP: model catalog. Extend this list (Kokoro, Orpheus, PersonaPlex
-// variants, etc.) as loaders are implemented worker-side. The `name`
-// is the exact string the worker's ipc_commands.load_model receives.
-const MODELS = [
-  { name: "moshi", label: "Moshi", hint: "3.5B · duplex · lighter" },
-  { name: "personaplex", label: "PersonaPlex", hint: "7B · duplex + persona" },
-] as const;
 
 // Human-readable mapping for phase strings emitted by the worker.
 // Phases are loading_* rather than downloading_* because HF's hub
@@ -39,6 +32,7 @@ export function ModelPicker() {
   const status = useServerStore((s) => s.inference);
   const pending = useServerStore((s) => s.pendingModel);
   const loadModel = useServerStore((s) => s.loadModel);
+  const models = useServerStore((s) => s.models);
 
   // Local: surfaced load error from the POST itself (vs a worker-side
   // error which lands in status.error). Cleared when a new load starts.
@@ -131,33 +125,47 @@ export function ModelPicker() {
           busy ? "pointer-events-none" : ""
         }`}
       >
-        {MODELS.map((m) => {
+        {models.length === 0 && serverUp && (
+          // REASON: catalog hasn't landed yet — first /models fetch is
+          // in flight. Render a quiet placeholder rather than nothing
+          // so the section doesn't visibly snap in.
+          <div className="text-muted-foreground italic">Loading catalog…</div>
+        )}
+        {models.map((m) => {
           const isActive =
             status.model === m.name && status.state === "serving";
           const isPending = pending === m.name || submitting === m.name;
+          // REASON: an `available: false` entry is shown so the user
+          // knows the model's coming, but the button is fully inert.
+          const clickable = m.available && !busy;
           return (
             <button
               key={m.name}
               type="button"
               onClick={() => onLoad(m.name)}
-              // REASON: only `busy` truly disables the button. When the
-              // server isn't up we want the click to still fire so
-              // onLoad can surface a toast — silently disabling leaves
-              // the user wondering why nothing happens.
-              disabled={busy}
+              // REASON: only `busy` (or unavailable) truly disables the
+              // button. When the server isn't up we want the click to
+              // still fire so onLoad can surface a toast — silently
+              // disabling leaves the user wondering why nothing happens.
+              disabled={!clickable}
+              aria-disabled={!m.available}
               className={`group/model flex flex-col items-start rounded border px-2 py-1.5 text-left transition-all ${
                 isActive
                   ? "border-primary bg-primary/10 text-foreground"
-                  : "cursor-pointer border-border bg-secondary text-secondary-foreground hover:translate-x-0.5 hover:border-primary/60 hover:bg-accent hover:shadow-sm"
+                  : m.available
+                    ? "cursor-pointer border-border bg-secondary text-secondary-foreground hover:translate-x-0.5 hover:border-primary/60 hover:bg-accent hover:shadow-sm"
+                    : "border-border bg-secondary/40 text-secondary-foreground"
               } ${
                 busy && !isPending
                   ? "opacity-40"
-                  : !serverUp
-                    ? "opacity-50"
-                    : ""
+                  : !m.available
+                    ? "opacity-60"
+                    : !serverUp
+                      ? "opacity-50"
+                      : ""
               }`}
             >
-              <span className="flex items-center gap-1.5 font-medium">
+              <span className="flex w-full items-center gap-1.5 font-medium">
                 {m.label}
                 {isPending && (
                   <span className="text-muted-foreground">· loading…</span>
@@ -168,8 +176,39 @@ export function ModelPicker() {
                     className="h-1.5 w-1.5 rounded-full bg-green-500"
                   />
                 )}
+                {!m.available && (
+                  <span className="text-[10px] uppercase tracking-wider text-muted-foreground">
+                    soon
+                  </span>
+                )}
+                {/* Download status badge — pushed to the right. We show
+                    "downloaded" with a check, "needs download" with a
+                    download glyph + size hint so the user knows what
+                    they're committing to on first click. */}
+                {m.available && (
+                  <span
+                    className={`ml-auto flex items-center gap-1 text-[10px] tabular-nums ${
+                      m.downloaded ? "text-green-500" : "text-muted-foreground"
+                    }`}
+                  >
+                    {m.downloaded ? (
+                      <>
+                        <Check className="h-3 w-3" />
+                        <span>{m.sizeGb}</span>
+                      </>
+                    ) : (
+                      <>
+                        <Download className="h-3 w-3" />
+                        <span>{m.sizeGb}</span>
+                      </>
+                    )}
+                  </span>
+                )}
               </span>
               <span className="text-muted-foreground">{m.hint}</span>
+              <span className="text-[10px] text-muted-foreground">
+                {m.requirements}
+              </span>
             </button>
           );
         })}

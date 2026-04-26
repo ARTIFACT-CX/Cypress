@@ -25,6 +25,12 @@ func RegisterRoutes(mux *http.ServeMux, mgr *Manager) {
 		writeJSON(w, http.StatusOK, mgr.Status())
 	})
 
+	mux.HandleFunc("/models", func(w http.ResponseWriter, _ *http.Request) {
+		// Static catalog + a per-call HF cache probe. Cheap (a few
+		// stat()s) so we recompute on every request rather than caching.
+		writeJSON(w, http.StatusOK, map[string]any{"models": ModelInfos()})
+	})
+
 	mux.HandleFunc("/model/load", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)

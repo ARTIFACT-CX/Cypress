@@ -15,6 +15,7 @@ import {
   SERVER_URL,
   useServerStore,
   type InferenceSnapshot,
+  type ModelInfo,
   type ServerStatus,
 } from "./serverStore";
 
@@ -50,6 +51,20 @@ async function pollOnce() {
   }
 }
 
+// Catalog fetch — separate from /status because it changes much less
+// often (only when a download completes). Pulled on every server-up
+// transition and again whenever inference flips to "serving" so the
+// `downloaded` flag updates without waiting for the next slow poll.
+async function fetchModels() {
+  try {
+    const res = await fetch(`${SERVER_URL}/models`);
+    const body = (await res.json()) as { models: ModelInfo[] };
+    useServerStore.getState().setModels(body.models ?? []);
+  } catch {
+    // Same fallback as /status — stale UI is better than crashing.
+  }
+}
+
 function schedulePoll() {
   if (pollHandle !== null) {
     clearTimeout(pollHandle);
@@ -77,6 +92,7 @@ export function initServerStore() {
       // interval.
       if (s.state === "running") {
         void pollOnce();
+        void fetchModels();
       }
       schedulePoll();
     })
@@ -88,10 +104,25 @@ export function initServerStore() {
     useServerStore.getState().setStatus(e.payload);
     if (e.payload.state === "running") {
       void pollOnce();
+      void fetchModels();
     }
     schedulePoll();
   }).then((un) => {
     unlistenServer = un;
+  });
+
+  // STEP 4: re-fetch the catalog whenever a load lands, so the
+  // `downloaded` badge updates without waiting for the user to open
+  // and close the picker. Cheap — server-side it's a few stat()s.
+  let lastInferenceState: InferenceSnapshot["state"] = "idle";
+  useServerStore.subscribe((s) => {
+    const next = s.inference.state;
+    if (next !== lastInferenceState) {
+      if (next === "serving" && s.status.state === "running") {
+        void fetchModels();
+      }
+      lastInferenceState = next;
+    }
   });
 
   // STEP 3: re-evaluate poll cadence when pendingModel or inference
