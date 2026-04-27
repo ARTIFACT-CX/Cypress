@@ -98,6 +98,18 @@ func (m *Manager) DownloadModel(name string) error {
 // before the worker accepts the IPC fails; once the worker has the
 // command, completion is reported via events (handleDownloadEvent).
 func (m *Manager) runDownload(ctx context.Context, name string, entry *catalogEntry) error {
+	// STEP 0: ensure the family venv exists. First-time downloads pay
+	// `uv sync` here — surface as a "preparing_env" phase so the UI
+	// progress bar doesn't silently freeze for the 30-60s wheel pull.
+	m.mu.Lock()
+	if cur := m.inflightDownloads[name]; cur != nil {
+		cur.Phase = "preparing_env"
+	}
+	m.mu.Unlock()
+	if err := m.ensureFamilyEnv(ctx, entry.Family); err != nil {
+		return fmt.Errorf("prepare family env: %w", err)
+	}
+
 	// Spawn or reuse the worker. Mirror LoadModel's spawn dance —
 	// state stays at whatever it was (idle/ready/serving), since
 	// download is orthogonal to load.
@@ -284,6 +296,13 @@ func (m *Manager) DeleteModel(name string) error {
 		if err := m.manifest.Delete(name); err != nil {
 			return fmt.Errorf("manifest delete: %w", err)
 		}
+	}
+
+	// STEP 3: if this was the last model from its family, drop the
+	// per-family venv too. Conservative — bails out if any sibling
+	// model is still installed, mid-download, or actively running.
+	if cat != nil && cat.Family != "" {
+		m.maybeRemoveFamilyEnv(cat.Family)
 	}
 	return nil
 }

@@ -26,6 +26,11 @@ type fakeWorker struct {
 	// stopErr is what stop returns. Default: nil.
 	stopErr error
 
+	// stopFn, if set, runs in stop() instead of just returning stopErr.
+	// Used by tests that need to observe a stop call (e.g. the
+	// idle-worker shutdown path in maybeRemoveFamilyEnv).
+	stopFn func(ctx context.Context) error
+
 	// onEvent captures whatever the Manager registered, so tests can fire
 	// synthetic events at the Manager's handler.
 	onEvent func(map[string]any)
@@ -50,7 +55,15 @@ func (f *fakeWorker) send(ctx context.Context, cmd string, extra map[string]any)
 	return map[string]any{"ok": true}, nil
 }
 
-func (f *fakeWorker) stop(_ context.Context) error { return f.stopErr }
+func (f *fakeWorker) stop(ctx context.Context) error {
+	f.mu.Lock()
+	fn := f.stopFn
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx)
+	}
+	return f.stopErr
+}
 
 func (f *fakeWorker) setOnEvent(fn func(map[string]any)) {
 	f.mu.Lock()

@@ -106,6 +106,18 @@ type Manager struct {
 	// keyed for quick lookup when the worker emits download_progress
 	// events. Cleared on download_done / download_error / cancellation.
 	inflightDownloads map[string]*DownloadProgress
+
+	// familySetupMu serializes per-family `uv sync` runs so two
+	// concurrent downloads against the same family don't race on the
+	// venv directory. Lazily populated; lookup is guarded by mu but
+	// the Lock/Unlock on the inner mutex happens without mu held.
+	familySetupMu map[string]*sync.Mutex
+
+	// syncFamily creates / refreshes the Python venv for a family.
+	// Defaults to running `uv sync`; tests inject a fake to avoid
+	// shelling out. SWAP seam for a future packaged build that ships
+	// a pre-baked venv and wants this to be a no-op.
+	syncFamily func(ctx context.Context, family string) error
 }
 
 // Snapshot is the Manager's external view — what the HTTP /status endpoint
@@ -138,18 +150,23 @@ func NewManager() *Manager {
 	return &Manager{
 		state:             StateIdle,
 		spawn:             defaultSpawn,
+		syncFamily:        defaultSyncFamily,
 		manifest:          mf,
 		inflightDownloads: map[string]*DownloadProgress{},
+		familySetupMu:     map[string]*sync.Mutex{},
 	}
 }
 
 // newManagerWithSpawn is the test constructor. Lets a unit test inject a
-// fake spawner without going through subprocess machinery.
+// fake spawner without going through subprocess machinery. syncFamily
+// defaults to a no-op so tests don't need a real uv on PATH.
 func newManagerWithSpawn(spawn spawnFn) *Manager {
 	return &Manager{
 		state:             StateIdle,
 		spawn:             spawn,
+		syncFamily:        func(_ context.Context, _ string) error { return nil },
 		inflightDownloads: map[string]*DownloadProgress{},
+		familySetupMu:     map[string]*sync.Mutex{},
 	}
 }
 
@@ -236,10 +253,29 @@ func (m *Manager) doLoad(ctx context.Context, name string, family string) {
 	m.mu.Unlock()
 
 	if needSpawn {
+		// STEP A0: ensure the family venv exists. Normally the user
+		// downloaded the model first (which sync'd the venv), so this
+		// is a fast os.Stat. The slow path is rare — manual venv
+		// removal or a fresh checkout where weights survived but
+		// .venv didn't.
+		m.mu.Lock()
+		m.phase = "preparing_env"
+		m.mu.Unlock()
+		if err := m.ensureFamilyEnv(ctx, family); err != nil {
+			m.mu.Lock()
+			m.state = StateIdle
+			m.phase = ""
+			m.lastError = err.Error()
+			m.mu.Unlock()
+			log.Printf("ensure family env failed: %v", err)
+			return
+		}
+
 		w, err := m.spawn(ctx, family)
 		m.mu.Lock()
 		if err != nil {
 			m.state = StateIdle
+			m.phase = ""
 			m.lastError = err.Error()
 			m.mu.Unlock()
 			log.Printf("worker spawn failed: %v", err)
