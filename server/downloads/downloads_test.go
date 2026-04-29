@@ -50,6 +50,10 @@ func (f *fakeWorker) SetOnEvent(fn func(map[string]any)) {
 	f.onEvent = fn
 }
 
+// Done returns a channel that never closes — these tests don't exercise
+// the auto-reconnect path, so the worker stays "alive" for the duration.
+func (f *fakeWorker) Done() <-chan struct{} { return nil }
+
 // fakeProvider satisfies WorkerProvider with the given fake worker as
 // the always-current handle. SpawnWorker installs the manager-style
 // onEvent handler on the fake (a no-op handler by default; override

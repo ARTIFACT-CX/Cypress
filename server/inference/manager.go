@@ -94,6 +94,12 @@ type Manager struct {
 	// downloads.WorkerProvider so the service can spawn/reuse this
 	// Manager's worker for download IPC.
 	downloads *downloads.Service
+
+	// remote is the configured remote endpoint, if any. Stored so the
+	// auto-reconnect path knows whether a transport drop should trigger
+	// a redial (remote: yes; local subprocess crash: no, surface and
+	// transition to idle).
+	remote *workers.RemoteEndpoint
 }
 
 // Config is the composition-root contract for building a Manager.
@@ -166,6 +172,7 @@ func NewManager(cfg Config) *Manager {
 		envSetup: envSetup,
 		manifest: mf,
 		spawn:    spawn,
+		remote:   cfg.Remote,
 	}
 	m.downloads = downloads.New(m, envSetup, mf)
 	return m
@@ -296,6 +303,7 @@ func (m *Manager) doLoad(ctx context.Context, name string, family string) {
 		m.workerFamily = family
 		m.state = StateLoading
 		m.mu.Unlock()
+		go m.watchWorker(w, family)
 	}
 
 	// STEP B: ask the worker to load the model. The "name" field matches
@@ -444,6 +452,7 @@ func (m *Manager) SpawnWorker(ctx context.Context, family string) (workers.Handl
 	if m.state == StateIdle {
 		m.state = StateReady
 	}
+	go m.watchWorker(spawned, family)
 	return spawned, nil
 }
 

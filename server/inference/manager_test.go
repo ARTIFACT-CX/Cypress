@@ -39,6 +39,29 @@ type fakeWorker struct {
 
 	// sendCalls records every send for ordering / arg assertions.
 	sendCalls []sendCall
+
+	// done backs the Done() signal. Lazily initialized so the zero-value
+	// fakeWorker still works. Tests simulating a transport drop call
+	// disconnect() to close it.
+	doneOnce sync.Once
+	doneCh   chan struct{}
+}
+
+// disconnect simulates the worker's transport dying — recvLoop
+// equivalent closing its done channel. Manager's watchWorker picks
+// this up and runs its recovery path.
+func (f *fakeWorker) disconnect() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.doneInitLocked()
+	close(f.doneCh)
+}
+
+// doneInitLocked is the lazy init for doneCh. Caller holds f.mu.
+// REASON: tests should be able to construct &fakeWorker{} without
+// extra setup; allocate the channel on first observation.
+func (f *fakeWorker) doneInitLocked() {
+	f.doneOnce.Do(func() { f.doneCh = make(chan struct{}) })
 }
 
 type sendCall struct {
@@ -60,6 +83,17 @@ func (f *fakeWorker) Send(ctx context.Context, cmd string, extra map[string]any)
 func (f *fakeWorker) Stop(ctx context.Context) error {
 	f.mu.Lock()
 	fn := f.stopFn
+	// REASON: mirror *Grpc — its recvLoop exits as part of Stop and that
+	// closes done. Manager's watchWorker checks m.worker != w to ignore
+	// expected drops, so closing here is safe and avoids leaking watcher
+	// goroutines in unit tests.
+	f.doneInitLocked()
+	select {
+	case <-f.doneCh:
+		// already closed by an explicit disconnect()
+	default:
+		close(f.doneCh)
+	}
 	f.mu.Unlock()
 	if fn != nil {
 		return fn(ctx)
@@ -71,6 +105,13 @@ func (f *fakeWorker) SetOnEvent(fn func(map[string]any)) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.onEvent = fn
+}
+
+func (f *fakeWorker) Done() <-chan struct{} {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.doneInitLocked()
+	return f.doneCh
 }
 
 // waitForState polls Status until it matches `want` or the deadline elapses.

@@ -25,4 +25,11 @@ type Handle interface {
 	Send(ctx context.Context, cmd string, extra map[string]any) (map[string]any, error)
 	Stop(ctx context.Context) error
 	SetOnEvent(fn func(map[string]any))
+	// Done returns a channel that closes when the underlying transport
+	// terminates — local subprocess exit, remote stream EOF, or
+	// transport-level error. Owners (inference.Manager) watch this to
+	// drive auto-reconnect. Stop closes the channel as part of normal
+	// teardown, so watchers must check whether the drop was expected
+	// before reacting.
+	Done() <-chan struct{}
 }

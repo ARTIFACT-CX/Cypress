@@ -322,6 +322,13 @@ func (w *Grpc) Stop(ctx context.Context) error {
 // its event handler.
 func (w *Grpc) SetOnEvent(fn func(map[string]any)) { w.onEvent = fn }
 
+// Done exposes the recvLoop exit signal so the Manager can drive
+// auto-reconnect on transport drops. recvLoop closes this in defer
+// regardless of why it exited (EOF, cancel, error), so it doubles as
+// the "transport ended" notification for both expected (Stop) and
+// unexpected (network drop, subprocess crash) terminations.
+func (w *Grpc) Done() <-chan struct{} { return w.done }
+
 // removeIfPresent unlinks the socket file if it still exists. The
 // kernel cleans up the socket binding when the Python process exits;
 // the on-disk inode does not. Best effort — leftover sockets are a
