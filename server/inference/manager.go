@@ -105,6 +105,12 @@ type Config struct {
 	// DataDir points at Cypress's metadata root (manifest, future
 	// settings). main.go resolves this to ~/.cypress in production.
 	DataDir string
+	// Remote, when non-nil, points the Manager at an external worker
+	// (RunPod / BYO GPU box) instead of spawning a local subprocess.
+	// The local WorkerDir / per-family venvs are unused in that mode —
+	// the remote container brings its own family. Composition-root
+	// builds this from CYPRESS_REMOTE_URL / _TOKEN env vars.
+	Remote *workers.RemoteEndpoint
 }
 
 // Snapshot is the Manager's external view — what the HTTP /status endpoint
@@ -134,17 +140,32 @@ func NewManager(cfg Config) *Manager {
 		log.Printf("manifest open failed (continuing without persistence): %v", err)
 		mf = nil
 	}
-	envSetup := workers.NewEnvSetup(cfg.WorkerDir, nil)
+	// REASON: when a remote endpoint is configured we don't need the
+	// local family-venv plumbing — the remote container ships its own.
+	// Pass a nil envSetup so Ensure/Remove become no-ops on this side.
+	var envSetup *workers.EnvSetup
+	if cfg.Remote == nil {
+		envSetup = workers.NewEnvSetup(cfg.WorkerDir, nil)
+	}
+	// REASON: pick the spawn closure based on transport. Local mode
+	// dispatches per family (each family has its own venv). Remote
+	// mode ignores the family arg — the deployed container is one
+	// fixed family, configured at deploy time, not per request.
+	var spawn SpawnFn
+	if cfg.Remote != nil {
+		spawn = func(ctx context.Context, _ string) (workers.Handle, error) {
+			return workers.DialRemote(ctx, cfg.Remote)
+		}
+	} else {
+		spawn = func(ctx context.Context, family string) (workers.Handle, error) {
+			return workers.SpawnLocal(ctx, cfg.WorkerDir, family)
+		}
+	}
 	m := &Manager{
 		state:    StateIdle,
 		envSetup: envSetup,
 		manifest: mf,
-		// REASON: close over workerDir so the spawn default remains
-		// context.Context-only at the call sites — Manager internals
-		// don't thread the path through every call.
-		spawn: func(ctx context.Context, family string) (workers.Handle, error) {
-			return workers.SpawnLocal(ctx, cfg.WorkerDir, family)
-		},
+		spawn:    spawn,
 	}
 	m.downloads = downloads.New(m, envSetup, mf)
 	return m

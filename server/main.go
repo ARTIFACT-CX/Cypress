@@ -24,6 +24,7 @@ import (
 
 	"github.com/ARTIFACT-CX/cypress/server/audio"
 	"github.com/ARTIFACT-CX/cypress/server/inference"
+	"github.com/ARTIFACT-CX/cypress/server/workers"
 )
 
 // inferenceAdapter bridges *inference.Manager (concrete, returns its own
@@ -100,6 +101,7 @@ func main() {
 	inferenceMgr := inference.NewManager(inference.Config{
 		WorkerDir: workerDir,
 		DataDir:   dataDir,
+		Remote:    resolveRemoteEndpoint(),
 	})
 	// REASON: inferenceMgr satisfies audio.InferenceClient (the interface
 	// declared inside the audio feature). Passing it as an interface
@@ -185,6 +187,21 @@ func resolveWorkerDir() (string, error) {
 		return "", err
 	}
 	return abs, nil
+}
+
+// resolveRemoteEndpoint reads CYPRESS_REMOTE_URL / _TOKEN and returns
+// a *workers.RemoteEndpoint when both are set, nil otherwise. Nil
+// means "spawn a local subprocess" — the historical default. We
+// require both so a half-configured env (URL without token) doesn't
+// silently dial unauthenticated.
+func resolveRemoteEndpoint() *workers.RemoteEndpoint {
+	url := os.Getenv("CYPRESS_REMOTE_URL")
+	token := os.Getenv("CYPRESS_REMOTE_TOKEN")
+	if url == "" || token == "" {
+		return nil
+	}
+	log.Printf("remote worker configured: %s", url)
+	return &workers.RemoteEndpoint{URL: url, Token: token}
 }
 
 // resolveDataDir picks ~/.cypress as the metadata root. We don't nest

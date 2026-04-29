@@ -23,6 +23,9 @@ import (
 	"path/filepath"
 	"syscall"
 	"time"
+
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // SETUP: how long we're willing to wait for the worker's
@@ -101,7 +104,10 @@ func SpawnLocal(ctx context.Context, workerDir, family string) (*Grpc, error) {
 		return nil, err
 	}
 
-	w, err := dialGRPC(ctx, "unix:"+sockPath, cmd, sockPath)
+	// REASON: insecure on a unix socket is fine — file perms are the
+	// auth, no network exposure.
+	opts := []grpc.DialOption{grpc.WithTransportCredentials(insecure.NewCredentials())}
+	w, err := dialGRPC(ctx, "unix:"+sockPath, opts, cmd, sockPath)
 	if err != nil {
 		killOnFail()
 		return nil, err

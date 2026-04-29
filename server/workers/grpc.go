@@ -23,7 +23,6 @@ import (
 	"syscall"
 
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
 
 	pb "github.com/ARTIFACT-CX/cypress/proto/dist/go/workerpb"
 )
@@ -73,12 +72,11 @@ type Grpc struct {
 // dialGRPC opens the Session bidi stream against `target` and waits
 // for the Handshake. The cmd / sockPath args are optional: pass them
 // for the local-subprocess flavor so Stop() can reap and clean up;
-// pass nil/"" for remote workers.
-func dialGRPC(ctx context.Context, target string, cmd *exec.Cmd, sockPath string) (*Grpc, error) {
-	// REASON: insecure on a unix socket is fine — file perms are the
-	// auth. Remote (TCP) callers will swap this for credentials.NewTLS
-	// + a per-RPC bearer creds when that path lands.
-	conn, err := grpc.NewClient(target, grpc.WithTransportCredentials(insecure.NewCredentials()))
+// pass nil/"" for remote workers. opts carries the transport credentials
+// and any per-RPC creds (e.g. bearer token) — local callers pass
+// insecure, remote callers pass TLS + bearer.
+func dialGRPC(ctx context.Context, target string, opts []grpc.DialOption, cmd *exec.Cmd, sockPath string) (*Grpc, error) {
+	conn, err := grpc.NewClient(target, opts...)
 	if err != nil {
 		return nil, fmt.Errorf("grpc dial %s: %w", target, err)
 	}
