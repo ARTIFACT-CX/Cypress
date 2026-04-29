@@ -1,0 +1,30 @@
+# AREA: build · DEPLOY
+# Build context exclusions for `docker build` against worker/Dockerfile.
+# The COPY worker/ line in that Dockerfile is intentionally broad
+# (other families' source comes along) so the in-image `models` package
+# stays consistent with dev — but per-family .venv directories and
+# bytecode caches must not bleed into the image. They're large (GBs of
+# torch/mlx wheels) and cache-bust on unrelated edits.
+
+# Per-family virtual envs — built locally for development, not for
+# container deployment.
+worker/models/*/.venv/
+worker/.venv/
+
+# Python bytecode caches.
+**/__pycache__/
+**/*.pyc
+
+# Editor / OS noise.
+.DS_Store
+.vscode/
+.idea/
+
+# Tauri shell & Go server are unrelated to the worker image.
+app/
+server/
+
+# Repo metadata not needed inside the image.
+.git/
+.github/
+.claude/

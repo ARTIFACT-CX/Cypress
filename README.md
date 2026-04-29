@@ -87,7 +87,8 @@ For poking the worker over JSON-line IPC directly:
 
 ```sh
 cd worker
-uv run python main.py
+# Use a family's venv directly so its model deps are on the path.
+models/moshi/.venv/bin/python main.py --family moshi
 ```
 
 ### Tests

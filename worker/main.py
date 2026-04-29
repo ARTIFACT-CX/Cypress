@@ -70,10 +70,9 @@ if _mps_high:
 
 import ipc
 
-# REASON: importing `models` triggers each concrete model's @register
-# decorator and populates models.REGISTRY. We do that here, in the
-# composition root, then hand the populated registry to ipc — keeping
-# ipc unaware of the models feature.
+# REASON: family selection happens here, in the composition root.
+# Each family lives in its own venv with conflicting deps, so we only
+# import the one this process is running — see models.load_family.
 import models
 
 
@@ -145,6 +144,16 @@ def main() -> None:
         ),
     )
     parser.add_argument(
+        "--family",
+        default=None,
+        help=(
+            "Model family to serve (e.g. 'moshi', 'personaplex'). Falls "
+            "back to CYPRESS_FAMILY env var. Required: workers are "
+            "family-scoped because per-family venvs hold conflicting "
+            "deps and only one family's stack is importable at a time."
+        ),
+    )
+    parser.add_argument(
         "--tls",
         nargs=2,
         metavar=("CERT", "KEY"),
@@ -159,6 +168,22 @@ def main() -> None:
     listen = args.listen or _default_listen()
     token = args.token or os.environ.get("CYPRESS_TOKEN") or None
     tls = _read_tls(args)
+    family = args.family or os.environ.get("CYPRESS_FAMILY") or None
+    if not family:
+        raise SystemExit(
+            "--family is required (or set CYPRESS_FAMILY). "
+            "Pick the family this venv was built for, e.g. 'moshi'."
+        )
+    # SETUP: trigger the family's @register decorators before we serve.
+    # Failing here (rather than at first load command) makes a misbuilt
+    # image fail loud at startup.
+    try:
+        models.load_family(family)
+    except ImportError as e:
+        raise SystemExit(
+            f"--family {family!r}: cannot import models.{family} — is the "
+            f"{family} venv built? ({e})"
+        ) from e
 
     try:
         asyncio.run(_run(listen, token, tls))

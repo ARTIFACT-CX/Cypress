@@ -80,7 +80,10 @@ func SpawnLocal(ctx context.Context, workerDir, family string) (*Grpc, error) {
 
 	// STEP 3: build the command. Stderr is forwarded to our stderr so
 	// Python tracebacks land in the server log unmodified.
-	cmd := exec.Command(pythonPath, "main.py", "--listen", "unix:"+sockPath)
+	// REASON: --family tells the worker which model subpackage to import.
+	// Per-family venvs hold conflicting deps, so only one family's stack
+	// is importable at a time and the worker requires the flag explicitly.
+	cmd := exec.Command(pythonPath, "main.py", "--listen", "unix:"+sockPath, "--family", family)
 	cmd.Dir = absWorkerDir
 	cmd.Env = os.Environ()
 	cmd.Stderr = os.Stderr
