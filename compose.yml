@@ -1,0 +1,56 @@
+# AREA: worker · DEPLOY · COMPOSE
+# Standard self-hosted deployment for the Cypress worker. Pulls the
+# published image from GHCR — no clone, no build. Operators who want
+# to run the worker on their own GPU box copy this file + the
+# .env.worker.example, fill in CYPRESS_TOKEN, and `docker compose up`.
+#
+# This file is not used for RunPod (their UI replaces compose) or for
+# local dev (the Tauri app spawns its own subprocess). It's for the
+# "BYO GPU box" / "lab workstation" deployment shape.
+
+services:
+  worker:
+    # REASON: pin to :main for now since v0.2 is in progress. Once a
+    # v0.2 tag ships, recommend swapping to :0.2 (or :latest) for
+    # release-pinned deployments.
+    image: ghcr.io/artifact-cx/cypress-worker-moshi:main
+
+    # SETUP: env_file pulls CYPRESS_TOKEN + optional overrides from a
+    # gitignored .env.worker. Falls back to compose's standard `.env`
+    # only for compose-level interpolation, not for container env.
+    env_file:
+      - .env.worker
+
+    # REASON: 7843 is the worker's documented gRPC port. Bind to
+    # loopback by default — operators add `0.0.0.0:7843:7843` for
+    # public exposure (where TLS is then terminated either at the
+    # worker via --tls or at an upstream reverse proxy).
+    ports:
+      - "127.0.0.1:7843:7843"
+
+    # SAFETY: persistent named volume for HF weights. Without this,
+    # every `docker compose down && up` redownloads 5–9 GB of Moshi
+    # weights. Mounted to the path HF_HOME defaults to inside the image.
+    volumes:
+      - hf-cache:/var/cache/huggingface
+
+    # REASON: a stuck worker should be restarted by the daemon, but
+    # a config error (bad token, missing TLS cert) shouldn't loop
+    # forever. `unless-stopped` restarts on crash but respects an
+    # explicit `docker compose stop`.
+    restart: unless-stopped
+
+    # PERF: GPU access. Uncomment on hosts with NVIDIA Container
+    # Toolkit installed. Without GPU, moshi falls back to CPU and
+    # latency goes from ~80ms to multi-second per frame — usable for
+    # smoke testing only.
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+volumes:
+  hf-cache:

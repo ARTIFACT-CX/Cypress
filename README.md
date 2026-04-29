@@ -105,16 +105,17 @@ cd server && go test -tags=integration ./...    # Integration (real worker subpr
 
 If your local hardware can't fit a model, or you would like to use cloud GPUs for better performance, Cypress can dial a worker running on a separate machine over gRPC. The local app, the Go server, and the protocol are all the same; only the worker moves.
 
-Two deployment paths are supported in v0.2:
+Three deployment shapes are supported in v0.2:
 
-- **RunPod (or any container host)** — public network, TLS + bearer token.
-- **SSH tunnel** (BYO GPU box, GT Phoenix, lab workstation) — loopback only, bearer token.
+- **Self-hosted Docker** (BYO GPU box, lab workstation with Docker) — `docker compose up`, TLS terminated at the worker or by an upstream reverse proxy.
+- **RunPod / managed container host** — same image, deployed via the platform's UI, TLS handled by the platform's HTTPS proxy.
+- **SSH tunnel** (HPC environments without Docker, e.g. GT Phoenix) — run from a Python venv, loopback-only, tunnel over SSH.
 
 Pick whichever matches where the GPU lives.
 
 ### Generate a shared token
 
-Both paths use the same scheme: the worker validates an `Authorization: Bearer <token>` header on every gRPC call. Generate a token once and use it on both ends:
+All three paths use the same scheme: the worker validates an `Authorization: Bearer <token>` header on every gRPC call. Generate a token once and use it on both ends:
 
 ```sh
 openssl rand -hex 32
@@ -122,17 +123,57 @@ openssl rand -hex 32
 
 Treat it like an API key. Anyone with the token can drive the worker; anyone with `(token, network access)` can open a session. Don't commit it.
 
-### Path A — RunPod / public container host
+### Path A — Self-hosted Docker (compose)
 
-This path runs a published worker image behind RunPod's HTTPS proxy (or any TLS-terminating ingress). No build step required.
+The fastest way to get a worker running on a GPU box you own. Pulls the published image from GHCR — no clone, no build.
+
+1. **On the GPU host**, grab `compose.yml` and the env template from this repo:
+
+   ```sh
+   curl -O https://raw.githubusercontent.com/ARTIFACT-CX/cypress/main/compose.yml
+   curl -O https://raw.githubusercontent.com/ARTIFACT-CX/cypress/main/.env.worker.example
+   mv .env.worker.example .env.worker
+   ```
+
+2. **Edit `.env.worker`** — set `CYPRESS_TOKEN` to the token you generated. Other values have sensible defaults.
+
+3. **(NVIDIA hosts)** uncomment the `deploy.resources` block in `compose.yml` to expose the GPU. Skip on CPU-only hosts (workable for smoke testing only — moshi on CPU is multi-second per frame).
+
+4. **Start it:**
+
+   ```sh
+   docker compose up -d
+   docker compose logs -f   # tail until you see "listening on tcp://0.0.0.0:7843"
+   ```
+
+5. **On your laptop**, point Cypress at the worker. By default `compose.yml` binds loopback-only — for a remote box you'll either expose `0.0.0.0:7843` (and terminate TLS at the worker or upstream) or tunnel over SSH:
+
+   ```sh
+   # Public exposure with TLS at the worker:
+   export CYPRESS_REMOTE_URL=grpcs://worker.example.com:7843
+   export CYPRESS_REMOTE_TOKEN=<the-token>
+
+   # Or SSH-tunneled:
+   ssh -N -L 7843:localhost:7843 <user>@<gpu-host> &
+   export CYPRESS_REMOTE_URL=tcp://localhost:7843
+   export CYPRESS_REMOTE_TOKEN=<the-token>
+
+   cd app && npm run desktop
+   ```
+
+   For TLS-at-the-worker, mount your cert/key into the container and append the flag to the compose service's `command:`. Let's Encrypt via DNS-01 is the simplest cert path.
+
+### Path B — RunPod / managed container host
+
+Same image, deployed via RunPod's UI. RunPod's HTTPS proxy terminates TLS so the container itself stays in plain TCP.
 
 1. **Pick an image tag** from [GHCR](https://github.com/ARTIFACT-CX/cypress/pkgs/container/cypress-worker-moshi):
    - `:latest` or `:0.2` — most recent release.
    - `:main` — floating, built from every commit on main; for pre-release testing.
 
-2. **Spin up a pod** with `ghcr.io/artifact-cx/cypress-worker-moshi:<tag>`, exposing port `7843`. Set `CYPRESS_TOKEN` to the token you generated. RunPod's HTTPS proxy terminates TLS for you, so no `--tls` flag is needed — the image binds `tcp://0.0.0.0:7843` and the proxy adds TLS.
+2. **Spin up a pod** with `ghcr.io/artifact-cx/cypress-worker-moshi:<tag>`, exposing port `7843`. Set `CYPRESS_TOKEN` to the token you generated. No `--tls` flag needed — the image binds `tcp://0.0.0.0:7843` and the proxy adds TLS.
 
-3. **Mount a volume** at `/var/cache/huggingface` so a restarted container doesn't redownload the 5–9 GB Moshi weights.
+3. **Mount a volume** at `/var/cache/huggingface` so a restarted pod doesn't redownload the 5–9 GB Moshi weights.
 
 4. **On your laptop**, point Cypress at the proxied URL:
 
@@ -144,8 +185,6 @@ This path runs a published worker image behind RunPod's HTTPS proxy (or any TLS-
 
 The Go server detects both env vars and dials the remote worker instead of spawning a local subprocess. The catalog UI works the same; "load Moshi" downloads the weights to the *pod*, not your laptop.
 
-If you're hosting on a box you control directly (no proxy), terminate TLS at the worker: mount `cert.pem` + `key.pem` into the container and append `--tls /certs/cert.pem /certs/key.pem` to the entrypoint. A 90-day Let's Encrypt cert via DNS-01 is the simplest path.
-
 #### Building from source
 
 Contributors and anyone running an unpublished family (PersonaPlex, future Kokoro/Orpheus) build locally:
@@ -155,9 +194,9 @@ docker build --build-arg FAMILY=moshi \
              -f worker/Dockerfile -t cypress-worker-moshi .
 ```
 
-For PersonaPlex, add `--build-arg EXTRA_APT=git` (its `moshi` dep is git-sourced). Push to any registry RunPod can pull from (Docker Hub, GHCR, ECR) and substitute the image reference in step 2.
+For PersonaPlex, add `--build-arg EXTRA_APT=git` (its `moshi` dep is git-sourced). Push to any registry your host can pull from (Docker Hub, GHCR, ECR) and substitute the image reference in your compose file or pod config.
 
-### Path B — SSH tunnel to a GPU box
+### Path C — SSH tunnel to a GPU box (no Docker)
 
 For workstations or HPC environments where you don't want to expose a public port. The worker binds loopback-only on the remote box; you tunnel `localhost:7843` over SSH.
 
