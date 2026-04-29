@@ -54,6 +54,12 @@ You'll need:
 - [uv](https://docs.astral.sh/uv/) — manages the per-family Python envs
 - An Apple Silicon Mac (Intel + Linux/Windows untested)
 
+Only needed if you edit `proto/worker.proto`:
+
+- `brew install protobuf` (provides `protoc`)
+- `go install google.golang.org/protobuf/cmd/protoc-gen-go@latest`
+- `go install google.golang.org/grpc/cmd/protoc-gen-go-grpc@latest`
+
 Install and run:
 
 ```sh

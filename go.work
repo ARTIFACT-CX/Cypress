@@ -1,0 +1,20 @@
+// AREA: build · GO · WORKSPACE
+//
+// Stitches the repo's two Go modules into one workspace so `go build` /
+// `go test` from anywhere under server/ can resolve the proto stubs
+// without them being a published module.
+//
+//   ./server         — the orchestration server (the actual binary)
+//   ./proto/dist/go  — protoc-generated stubs, shared with the Python
+//                      worker side; lives outside server/ so the schema
+//                      isn't owned by any one feature.
+//
+// To regenerate the stubs after editing the .proto schema:
+// run ./proto/gen.sh.
+
+go 1.26.1
+
+use (
+	./server
+	./proto/dist/go
+)

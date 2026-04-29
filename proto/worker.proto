@@ -1,0 +1,188 @@
+// AREA: proto · WORKER · v1
+//
+// Wire schema for the Go ↔ Python worker IPC. One bidi gRPC stream per
+// connection carries every command, reply, and event. Messages are
+// multiplexed via the ClientMsg.payload / ServerMsg.payload oneofs;
+// id correlation matches each Reply back to its issuing ClientMsg.
+//
+// Local subprocess and remote worker share this schema — only the
+// transport (Unix socket vs TCP+TLS) differs. The dispatcher on the
+// Python side is the same for both.
+
+syntax = "proto3";
+
+package cypress.worker.v1;
+
+option go_package = "github.com/ARTIFACT-CX/cypress/proto/dist/go/workerpb";
+
+// Service entry point. One bidi stream is opened per Manager↔worker
+// session; closing the stream tears the session down. The first
+// ServerMsg the client receives must be Handshake{ready=true}; any
+// other first message is treated as a startup failure by the host.
+service Worker {
+  rpc Session(stream ClientMsg) returns (stream ServerMsg);
+}
+
+// ---------------------------------------------------------------------
+// Client → server messages.
+// ---------------------------------------------------------------------
+
+message ClientMsg {
+  // Correlation id. Required for any command that expects a Reply;
+  // 0 means "no reply expected" (currently unused — every command
+  // produces a reply, but reserved for future fire-and-forget paths).
+  uint64 id = 1;
+
+  oneof payload {
+    StatusReq status                  = 10;
+    LoadModelReq load_model           = 11;
+    UnloadReq unload                  = 12;
+    ShutdownReq shutdown              = 13;
+    RunWavReq run_wav                 = 14;
+    StartStreamReq start_stream       = 20;
+    AudioInReq audio_in               = 21;  // PCM as native bytes
+    StopStreamReq stop_stream         = 22;
+    DownloadModelReq download_model   = 30;
+    CancelDownloadReq cancel_download = 31;
+  }
+}
+
+message StatusReq {}
+message UnloadReq {}
+message ShutdownReq {}
+message StartStreamReq {}
+message StopStreamReq {}
+message CancelDownloadReq {}
+
+message LoadModelReq {
+  string name = 1;
+}
+
+message RunWavReq {
+  string input = 1;
+  string output = 2;
+}
+
+// PCM is int16 LE mono at the session's sample rate (24kHz for Moshi).
+// Native bytes — drops the base64 tax that the JSON-over-stdio
+// protocol paid on every 80ms frame.
+message AudioInReq {
+  bytes pcm = 1;
+}
+
+message DownloadModelReq {
+  string name = 1;
+  string repo = 2;
+  repeated string files = 3;
+  optional string revision = 4;
+}
+
+// ---------------------------------------------------------------------
+// Server → client messages.
+// ---------------------------------------------------------------------
+
+message ServerMsg {
+  oneof payload {
+    Handshake handshake = 1;  // First message after stream open.
+    Reply reply         = 2;  // Response to a ClientMsg with same id.
+    Event event         = 3;  // Unsolicited (no id correlation).
+  }
+}
+
+// Sent once after the server-side dispatcher is wired up. Exists so
+// the host can distinguish "worker is ready" from "stream opened but
+// worker still importing torch." If startup fails, the server may
+// instead send Handshake{ready=false, fatal=...} and close the stream.
+message Handshake {
+  bool ready = 1;
+  optional string fatal = 2;
+}
+
+message Reply {
+  uint64 id = 1;
+  oneof result {
+    OkEmpty ok                          = 2;   // Generic ok with no payload.
+    StatusOk status                     = 10;
+    LoadModelOk load_model              = 11;
+    StartStreamOk start_stream          = 12;
+    DownloadStartedOk download_started  = 13;
+    CancelDownloadOk cancel_download    = 14;
+    string error                        = 99;  // Handler-level failure message.
+  }
+}
+
+message OkEmpty {}
+
+message StatusOk {
+  optional string model = 1;
+  optional string device = 2;
+}
+
+message LoadModelOk {
+  string model = 1;
+  optional string device = 2;
+}
+
+message StartStreamOk {
+  uint32 sample_rate = 1;
+}
+
+message DownloadStartedOk {
+  bool started = 1;
+}
+
+message CancelDownloadOk {
+  bool active = 1;
+}
+
+// ---------------------------------------------------------------------
+// Out-of-band events. Worker → host, no correlation id.
+// ---------------------------------------------------------------------
+
+message Event {
+  oneof payload {
+    ModelPhase model_phase             = 1;
+    AudioOut audio_out                 = 2;  // PCM as native bytes
+    StreamError stream_error           = 3;
+    DownloadProgress download_progress = 4;
+    DownloadDone download_done         = 5;
+    DownloadError download_error       = 6;
+  }
+}
+
+message ModelPhase {
+  string phase = 1;
+  optional string device = 2;  // Some phases announce the target device.
+}
+
+message AudioOut {
+  bytes pcm = 1;
+  string text = 2;  // Inner-monologue token; usually empty.
+}
+
+message StreamError {
+  string error = 1;
+}
+
+message DownloadProgress {
+  string name = 1;
+  string phase = 2;
+  uint64 downloaded = 3;
+  uint64 total = 4;
+  string file = 5;
+  uint32 file_index = 6;
+  uint32 file_count = 7;
+}
+
+message DownloadDone {
+  string name = 1;
+  string repo = 2;
+  optional string revision = 3;
+  repeated string files = 4;
+  uint64 total_bytes = 5;
+}
+
+message DownloadError {
+  string name = 1;
+  string error = 2;
+}
