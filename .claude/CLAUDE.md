@@ -116,7 +116,7 @@ Inference code runs on devices where leaks turn into crashes, not warnings. On M
 
 - **Always wrap inference in `torch.inference_mode()`** (or at minimum `torch.no_grad()`) — anywhere a model's forward pass runs outside training. Without it, every step retains its autograd graph; over a streaming session that's GBs of dangling tensors.
 - This applies to streaming paths and one-shot calls alike. If a function calls into a `torch.nn.Module` and isn't training, it needs the wrapper.
-- When swapping models, drop references *and* call the device's allocator-release hook (`torch.mps.empty_cache()` / `torch.cuda.empty_cache()`). The caching allocator doesn't free until asked.
+- When swapping models, drop references _and_ call the device's allocator-release hook (`torch.mps.empty_cache()` / `torch.cuda.empty_cache()`). The caching allocator doesn't free until asked.
 - Tensors leaving the hot loop go through `.cpu()` (or `.numpy()`) before the loop body ends — don't accumulate device tensors in Python lists.
 - Bounded queues only on streaming paths. Unbounded `asyncio.Queue` / Go channel between a fast producer and a slow consumer is a slow-motion crash.
 
@@ -198,8 +198,10 @@ Don't create README, design docs, or summary markdown files unless explicitly as
 - **Do not add `Co-Authored-By: Claude` (or any Claude co-author trailer) to commit messages.** This overrides the default tool guidance. Commits should look authored by the human; the AI assistance is a tooling detail, not a credit.
 - Same rule for PR bodies: no "🤖 Generated with Claude Code" footer, no co-author trailer.
 
+Always confirm with user before commiting and pushing changes
+
 ### Track progress on GitHub issues
 
 When work maps to an existing GitHub issue, post a progress comment on that issue as commits land — list the relevant commit SHAs and a short note on what's done vs still pending. Don't close the issue until it's actually finished end-to-end. Use `gh issue comment <n>` for the updates and `gh issue view <n>` first to confirm scope before commenting.
 
-When *creating* a new issue, also add it to the Cypress project board so it shows up on the roadmap — milestones alone don't surface there. After `gh issue create` returns the URL, run `gh project item-add 3 --owner ARTIFACT-CX --url <url>`.
+When _creating_ a new issue, also add it to the Cypress project board so it shows up on the roadmap — milestones alone don't surface there. After `gh issue create` returns the URL, run `gh project item-add 3 --owner ARTIFACT-CX --url <url>`.
