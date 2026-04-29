@@ -17,7 +17,7 @@
 #     real subprocesses and gRPC. Pre-release / on-demand.
 #   - app/ — exempt from testing per CLAUDE.md.
 
-name: Test
+name: Tests
 
 on:
   pull_request:
@@ -43,10 +43,10 @@ jobs:
       run:
         working-directory: server
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Set up Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@v6
         with:
           # REASON: pinned to the toolchain in server/go.mod. setup-go
           # reads go.mod's `go` directive directly, so no duplication.
@@ -66,13 +66,13 @@ jobs:
       run:
         working-directory: worker
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       # SETUP: uv handles Python installation and venv creation in one
       # step; no separate setup-python needed. The version pin matches
       # what the worker is tested against.
       - name: Install uv
-        uses: astral-sh/setup-uv@v5
+        uses: astral-sh/setup-uv@v8
         with:
           enable-cache: true
           cache-dependency-glob: worker/uv.lock
