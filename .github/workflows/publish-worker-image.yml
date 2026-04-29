@@ -1,0 +1,98 @@
+# AREA: build · CI · DEPLOY
+# Build + push the per-family worker container image to GHCR.
+#
+# Trigger matrix:
+#   - push to main             → ghcr.io/.../cypress-worker-moshi:main
+#                                (floating, for testing pre-release).
+#   - push of a `v*` tag       → ghcr.io/.../cypress-worker-moshi:<version>
+#                                + :latest. <version> strips the leading
+#                                v (v0.2.0 → 0.2.0) so users pin a clean
+#                                semver tag.
+#   - workflow_dispatch        → manual rebuild, tags as the source ref.
+#
+# Currently only the moshi family is published. PersonaPlex (#3) ships
+# scaffolding but no working loader; an image of it would be a footgun.
+# When that lands, add `personaplex` to the matrix and a sibling block
+# of metadata-action `images:` with the matching image name.
+
+name: Publish worker image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+# REASON: lock down to least-privilege at the workflow level. We only
+# need to read the repo and write packages (= push to GHCR under the
+# same org).
+permissions:
+  contents: read
+  packages: write
+
+# REASON: a new push to main supersedes the in-flight build. Tag pushes
+# stay independent — they're cheap to dedupe by their own ref and we
+# don't want a release build cancelled by a follow-up commit.
+concurrency:
+  group: publish-worker-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref == 'refs/heads/main' }}
+
+jobs:
+  build-push:
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - family: moshi
+            image: ghcr.io/artifact-cx/cypress-worker-moshi
+            extra_apt: ""
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # SETUP: buildx gives us cross-platform + better layer caching
+      # than the classic builder. We're amd64-only for now but keep the
+      # door open.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # STEP 1: derive the tag set from the ref. metadata-action handles
+      # the "v0.2.0 tag → :0.2.0 + :latest" logic and the "main → :main"
+      # logic without us hand-rolling shell.
+      - name: Derive image tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ matrix.image }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+
+      # STEP 2: build + push. Cache to/from GHA so successive builds on
+      # main don't re-resolve uv from scratch.
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: worker/Dockerfile
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            FAMILY=${{ matrix.family }}
+            EXTRA_APT=${{ matrix.extra_apt }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=worker-${{ matrix.family }}
+          cache-to: type=gha,scope=worker-${{ matrix.family }},mode=max

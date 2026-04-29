@@ -124,24 +124,17 @@ Treat it like an API key. Anyone with the token can drive the worker; anyone wit
 
 ### Path A — RunPod / public container host
 
-This path runs the worker as a Docker container behind RunPod's HTTPS proxy (or any TLS-terminating ingress).
+This path runs a published worker image behind RunPod's HTTPS proxy (or any TLS-terminating ingress). No build step required.
 
-1. **Build the image** from a checkout of this repo. One image per family — the Moshi family's deps and PersonaPlex's NVIDIA fork can't coexist:
+1. **Pick an image tag** from [GHCR](https://github.com/ARTIFACT-CX/cypress/pkgs/container/cypress-worker-moshi):
+   - `:latest` or `:0.2` — most recent release.
+   - `:main` — floating, built from every commit on main; for pre-release testing.
 
-   ```sh
-   docker build --build-arg FAMILY=moshi \
-                -f worker/Dockerfile -t cypress-worker-moshi .
-   ```
+2. **Spin up a pod** with `ghcr.io/artifact-cx/cypress-worker-moshi:<tag>`, exposing port `7843`. Set `CYPRESS_TOKEN` to the token you generated. RunPod's HTTPS proxy terminates TLS for you, so no `--tls` flag is needed — the image binds `tcp://0.0.0.0:7843` and the proxy adds TLS.
 
-   For PersonaPlex, add `--build-arg EXTRA_APT=git` (its `moshi` dep is git-sourced).
+3. **Mount a volume** at `/var/cache/huggingface` so a restarted container doesn't redownload the 5–9 GB Moshi weights.
 
-2. **Push to a registry** RunPod can pull from (Docker Hub, GHCR, ECR, etc.). Cypress doesn't publish images yet — you build and push your own.
-
-3. **Spin up a pod**, exposing port `7843`. Set the `CYPRESS_TOKEN` env var to the token you generated. RunPod's HTTPS proxy terminates TLS for you, so no `--tls` flag is needed inside the container — the entrypoint already binds `tcp://0.0.0.0:7843` and the proxy adds TLS.
-
-4. **Mount a volume** at `/var/cache/huggingface` so a restarted container doesn't redownload the 5–9 GB Moshi weights (~16 GB for PersonaPlex).
-
-5. **On your laptop**, point Cypress at the proxied URL:
+4. **On your laptop**, point Cypress at the proxied URL:
 
    ```sh
    export CYPRESS_REMOTE_URL=grpcs://<your-pod>.proxy.runpod.net:443
@@ -151,7 +144,18 @@ This path runs the worker as a Docker container behind RunPod's HTTPS proxy (or 
 
 The Go server detects both env vars and dials the remote worker instead of spawning a local subprocess. The catalog UI works the same; "load Moshi" downloads the weights to the *pod*, not your laptop.
 
-If you're hosting on a box you control directly (no proxy), terminate TLS at the worker. Mount `cert.pem` + `key.pem` into the container and append `--tls /certs/cert.pem /certs/key.pem` to the entrypoint. A 90-day Let's Encrypt cert via DNS-01 is the simplest path.
+If you're hosting on a box you control directly (no proxy), terminate TLS at the worker: mount `cert.pem` + `key.pem` into the container and append `--tls /certs/cert.pem /certs/key.pem` to the entrypoint. A 90-day Let's Encrypt cert via DNS-01 is the simplest path.
+
+#### Building from source
+
+Contributors and anyone running an unpublished family (PersonaPlex, future Kokoro/Orpheus) build locally:
+
+```sh
+docker build --build-arg FAMILY=moshi \
+             -f worker/Dockerfile -t cypress-worker-moshi .
+```
+
+For PersonaPlex, add `--build-arg EXTRA_APT=git` (its `moshi` dep is git-sourced). Push to any registry RunPod can pull from (Docker Hub, GHCR, ECR) and substitute the image reference in step 2.
 
 ### Path B — SSH tunnel to a GPU box
 
