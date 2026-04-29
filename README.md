@@ -112,4 +112,9 @@ See [`.claude/CLAUDE.md`](./.claude/CLAUDE.md) for the architectural conventions
 
 ## License
 
-TBD — open-source core planned.
+Apache License 2.0 — see [LICENSE](./LICENSE). Copyright © OptionWatch Inc.
+
+You're free to use, modify, distribute, and build commercial products on top
+of this code; the license requires you to preserve copyright notices and
+ships an explicit patent grant. Contributions to this repo are accepted
+under the same terms.
