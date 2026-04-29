@@ -1,0 +1,89 @@
+# AREA: build · CI · TEST
+# Run the fast unit suites on every PR + push to main. This is the
+# branch-protection status-check gate for merges into main.
+#
+# Two parallel jobs:
+#   - go:     server/ unit tests via `go test ./...`
+#   - worker: worker/ shared unit tests via `uv run pytest`
+#             (excludes per-family tests + integration markers; the
+#             pytest config in worker/pyproject.toml handles both
+#             exclusions automatically).
+#
+# Out of scope here:
+#   - Moshi family tests (worker/models/moshi/) — needs torch + the
+#     moshi package, multi-minute install. Run on demand or nightly
+#     in a separate workflow.
+#   - Integration tests (-tags=integration / -m integration) — spin up
+#     real subprocesses and gRPC. Pre-release / on-demand.
+#   - app/ — exempt from testing per CLAUDE.md.
+
+name: Test
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+# REASON: a fresh push to a PR cancels the previous in-flight run for
+# the same ref. main is excluded from the cancel so post-merge runs
+# always complete.
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go unit tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          # REASON: pinned to the toolchain in server/go.mod. setup-go
+          # reads go.mod's `go` directive directly, so no duplication.
+          go-version-file: server/go.mod
+          cache-dependency-path: server/go.sum
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        run: go test ./...
+
+  worker:
+    name: Worker unit tests (shared)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - uses: actions/checkout@v4
+
+      # SETUP: uv handles Python installation and venv creation in one
+      # step; no separate setup-python needed. The version pin matches
+      # what the worker is tested against.
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: worker/uv.lock
+
+      - name: Sync dev deps
+        # REASON: --frozen is non-negotiable in CI — a stale lock should
+        # fail loud rather than silently regenerate. --group dev pulls
+        # pytest + asyncio helper.
+        run: uv sync --frozen --group dev
+
+      - name: Test
+        # REASON: addopts in pyproject.toml already excludes integration
+        # markers and the family test tree. No extra flags needed.
+        run: uv run pytest
