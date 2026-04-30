@@ -93,9 +93,20 @@ message ServerMsg {
 // the host can distinguish "worker is ready" from "stream opened but
 // worker still importing torch." If startup fails, the server may
 // instead send Handshake{ready=false, fatal=...} and close the stream.
+//
+// os/arch/available_backends/downloaded_repos let the host pick model
+// variants (MLX vs torch, quantization, repo) that match the worker's
+// actual platform — without these, an Apple-Silicon laptop dialing a
+// Linux GPU worker would tell it to download MLX weights it can't run.
+// downloaded_repos is a snapshot taken when the worker boots; the host
+// keeps it current via download_done events for that session.
 message Handshake {
   bool ready = 1;
   optional string fatal = 2;
+  string os = 3;                            // "linux" | "darwin" | "windows"
+  string arch = 4;                          // "amd64" | "arm64"
+  repeated string available_backends = 5;   // ["torch"] | ["mlx", "torch"]
+  repeated string downloaded_repos = 6;     // HF repo IDs already cached
 }
 
 message Reply {

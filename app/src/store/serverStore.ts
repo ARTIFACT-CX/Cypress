@@ -98,12 +98,17 @@ type ServerStore = {
   // /models fetch and refreshed when the inference state changes
   // (e.g. a load completing flips a model's downloaded flag).
   models: ModelInfo[];
+  // True while the server's eager remote-platform probe is in flight
+  // (remote-worker mode only). UI renders a spinner over the catalog
+  // instead of an empty grid. Always false in local mode.
+  catalogLoading: boolean;
 
   // --- internal setters used by bootstrap + actions -------------------
   setStatus: (s: ServerStatus) => void;
   setInference: (s: InferenceSnapshot) => void;
   setPendingModel: (name: string | null) => void;
   setModels: (m: ModelInfo[]) => void;
+  setCatalog: (c: { models: ModelInfo[]; loading: boolean }) => void;
 
   // --- actions --------------------------------------------------------
   startServer: () => Promise<void>;
@@ -119,6 +124,7 @@ export const useServerStore = create<ServerStore>((set, get) => ({
   inference: EMPTY_SNAPSHOT,
   pendingModel: null,
   models: [],
+  catalogLoading: false,
 
   setStatus: (status) => {
     set({ status });
@@ -127,7 +133,12 @@ export const useServerStore = create<ServerStore>((set, get) => ({
     // showing "Moshi serving" from before. Same idea handled in the
     // old ModelPicker via a separate effect.
     if (status.state !== "running") {
-      set({ inference: EMPTY_SNAPSHOT, pendingModel: null, models: [] });
+      set({
+        inference: EMPTY_SNAPSHOT,
+        pendingModel: null,
+        models: [],
+        catalogLoading: false,
+      });
     }
   },
   setInference: (inference) => {
@@ -149,6 +160,7 @@ export const useServerStore = create<ServerStore>((set, get) => ({
   },
   setPendingModel: (pendingModel) => set({ pendingModel }),
   setModels: (models) => set({ models }),
+  setCatalog: ({ models, loading }) => set({ models, catalogLoading: loading }),
 
   startServer: async () => {
     await invoke("start_server");

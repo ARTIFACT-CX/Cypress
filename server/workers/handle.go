@@ -32,4 +32,32 @@ type Handle interface {
 	// teardown, so watchers must check whether the drop was expected
 	// before reacting.
 	Done() <-chan struct{}
+	// Platform returns the worker's reported platform snapshot, captured
+	// from the gRPC Handshake at session open. Empty fields mean "the
+	// worker didn't report" (older worker, fake test handle); callers
+	// should fall back to the host's runtime in that case.
+	Platform() Platform
+	// Disconnect closes the gRPC channel without telling the worker to
+	// shut down. Used by the eager platform probe — the host reads the
+	// handshake, then drops the session so subsequent LoadModel /
+	// Download dials get a fresh stream against the same worker
+	// process. Stop, by contrast, sends a `shutdown` RPC that kills
+	// the Python process; using it from the probe leaves nothing for
+	// the next dial to connect to. For local subprocess workers this
+	// also leaves the process running, so callers must follow up with
+	// Stop later if they want it reaped.
+	Disconnect() error
+}
+
+// Platform is the snapshot the worker stamps onto every Handshake. The
+// Go host uses these fields to pick model variants — without them, an
+// Apple-Silicon laptop dialing a Linux GPU worker would tell it to
+// download MLX weights it can't load. OS / Arch follow Go's runtime
+// naming ("linux"/"darwin", "amd64"/"arm64") so the host can compare
+// strings without a translation table.
+type Platform struct {
+	OS                string
+	Arch              string
+	AvailableBackends []string
+	DownloadedRepos   []string
 }

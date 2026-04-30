@@ -44,14 +44,23 @@ type DownloadProgress struct {
 	Error      string `json:"error,omitempty"`
 }
 
-// ModelInfos returns the catalog with download status filled in.
-// Computed fresh on each call — the cache directory could change
-// between calls if the user kicks off a load. inflight maps model
-// name → live download progress and is merged in for any matching
-// entry; pass nil if no downloads are tracked.
-func ModelInfos(inflight map[string]*DownloadProgress) []ModelInfo {
-	root := HubCacheDir()
-	cat := Catalog()
+// ModelInfos returns the catalog with download status filled in for
+// the target platform. inflight maps model name → live download
+// progress and is merged in for any matching entry; pass nil if no
+// downloads are tracked. downloadedRepos is the authoritative set of
+// HF repos already cached on the worker — pass nil to fall back to a
+// local-disk probe (correct for local subprocess; misleading for
+// remote workers because the laptop's cache is empty).
+func ModelInfos(os, arch string, downloadedRepos map[string]bool, inflight map[string]*DownloadProgress) []ModelInfo {
+	cat := Catalog(os, arch)
+	// REASON: only consult the laptop's HF cache when no authoritative
+	// set was supplied. Remote workers ship their own — using
+	// IsRepoCached on the laptop side would always report false and
+	// the UI would flip back to "Download" after every successful pull.
+	var localRoot string
+	if downloadedRepos == nil {
+		localRoot = HubCacheDir()
+	}
 	out := make([]ModelInfo, 0, len(cat))
 	for _, e := range cat {
 		info := ModelInfo{
@@ -64,7 +73,11 @@ func ModelInfos(inflight map[string]*DownloadProgress) []ModelInfo {
 			SizeGB:       e.SizeGB,
 			Requirements: e.Requirements,
 			Available:    e.Available,
-			Downloaded:   IsRepoCached(root, e.Repo),
+		}
+		if downloadedRepos != nil {
+			info.Downloaded = downloadedRepos[e.Repo]
+		} else {
+			info.Downloaded = IsRepoCached(localRoot, e.Repo)
 		}
 		if inflight != nil {
 			if p, ok := inflight[e.Name]; ok && p != nil {

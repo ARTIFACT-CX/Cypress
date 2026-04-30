@@ -64,6 +64,11 @@ type Grpc struct {
 	// caller after spawn.
 	onEvent func(map[string]any)
 
+	// platform is the snapshot captured from the gRPC Handshake. Read-
+	// only after dialGRPC returns; no mutex needed because subsequent
+	// reads happen on the host side after construction completes.
+	platform Platform
+
 	// done closes when the recv loop exits. Used to unblock Send callers
 	// with a clear error rather than hanging forever.
 	done chan struct{}
@@ -147,6 +152,12 @@ func dialGRPC(ctx context.Context, target string, opts []grpc.DialOption, cmd *e
 		waiters:  make(map[uint64]chan reply),
 		sendCh:   make(chan *pb.ClientMsg, 16),
 		done:     make(chan struct{}),
+		platform: Platform{
+			OS:                hs.GetOs(),
+			Arch:              hs.GetArch(),
+			AvailableBackends: append([]string(nil), hs.GetAvailableBackends()...),
+			DownloadedRepos:   append([]string(nil), hs.GetDownloadedRepos()...),
+		},
 	}
 
 	// STEP: hand the stream off to the read + write loops. Send is
@@ -328,6 +339,25 @@ func (w *Grpc) SetOnEvent(fn func(map[string]any)) { w.onEvent = fn }
 // the "transport ended" notification for both expected (Stop) and
 // unexpected (network drop, subprocess crash) terminations.
 func (w *Grpc) Done() <-chan struct{} { return w.done }
+
+// Platform returns the worker's reported platform snapshot. Captured
+// once at handshake time; remains valid for the life of the handle.
+func (w *Grpc) Platform() Platform { return w.platform }
+
+// Disconnect closes the gRPC channel without sending a shutdown RPC,
+// leaving the worker process running. Used by the eager platform probe
+// in remote mode so the next LoadModel / Download dial finds the
+// worker still listening — calling Stop instead would kill the
+// Python process and the next dial would get RST'd at the kernel.
+//
+// SAFETY: Stop is the right teardown path for "we're done with this
+// worker." Disconnect is specifically for "we just wanted a handshake;
+// keep the worker alive."
+func (w *Grpc) Disconnect() error {
+	close(w.sendCh)
+	w.cancel()
+	return w.conn.Close()
+}
 
 // removeIfPresent unlinks the socket file if it still exists. The
 // kernel cleans up the socket binding when the Python process exits;

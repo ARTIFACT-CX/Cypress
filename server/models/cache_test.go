@@ -73,11 +73,14 @@ func TestModelInfos_PopulatesAvailableAndDownloaded(t *testing.T) {
 	// pre-cached so we can assert the dynamic fields land correctly.
 	// Picks the right repo for the current platform via the same
 	// helper the catalog uses.
-	entry := DefaultMoshiEntry()
+	host, arch := HostPlatform()
+	entry := DefaultMoshiEntry(host, arch)
 	root := makeFakeRepo(t, entry.Repo, true)
 	t.Setenv("HUGGINGFACE_HUB_CACHE", root)
 
-	infos := ModelInfos(nil)
+	// nil downloadedRepos forces the local-disk probe path — what the
+	// local-subprocess flavor uses today.
+	infos := ModelInfos(host, arch, nil, nil)
 	var moshi *ModelInfo
 	for i := range infos {
 		if infos[i].Name == "moshi" {

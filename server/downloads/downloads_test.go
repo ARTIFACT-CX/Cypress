@@ -54,6 +54,13 @@ func (f *fakeWorker) SetOnEvent(fn func(map[string]any)) {
 // the auto-reconnect path, so the worker stays "alive" for the duration.
 func (f *fakeWorker) Done() <-chan struct{} { return nil }
 
+// Platform returns an empty snapshot — download tests don't read it;
+// Service.Start takes explicit (os, arch) args from the caller.
+func (f *fakeWorker) Platform() workers.Platform { return workers.Platform{} }
+
+// Disconnect is a no-op — these tests don't drive the eager probe path.
+func (f *fakeWorker) Disconnect() error { return nil }
+
 // fakeProvider satisfies WorkerProvider with the given fake worker as
 // the always-current handle. SpawnWorker installs the manager-style
 // onEvent handler on the fake (a no-op handler by default; override
@@ -115,7 +122,7 @@ func TestStart_HappyPath(t *testing.T) {
 	}
 	s, _ := newTestService(t, fake)
 
-	if err := s.Start("moshi"); err != nil {
+	if err := s.Start("moshi", "linux", "amd64"); err != nil {
 		t.Fatalf("Start: %v", err)
 	}
 
@@ -173,17 +180,17 @@ func TestStart_RejectsConcurrent(t *testing.T) {
 	}
 	s, _ := newTestService(t, fake)
 
-	if err := s.Start("moshi"); err != nil {
+	if err := s.Start("moshi", "linux", "amd64"); err != nil {
 		t.Fatalf("first Start: %v", err)
 	}
-	if err := s.Start("moshi"); err == nil {
+	if err := s.Start("moshi", "linux", "amd64"); err == nil {
 		t.Fatal("second Start should error while first is in flight")
 	}
 }
 
 func TestStart_UnknownRejected(t *testing.T) {
 	s, _ := newTestService(t, &fakeWorker{})
-	if err := s.Start("not-a-real-model"); err == nil {
+	if err := s.Start("not-a-real-model", "linux", "amd64"); err == nil {
 		t.Fatal("unknown model should be rejected")
 	}
 }
@@ -192,7 +199,7 @@ func TestStart_RejectsCrossFamily(t *testing.T) {
 	fake := &fakeWorker{}
 	s, provider := newTestService(t, fake)
 	provider.family = "personaplex" // worker already running another family
-	if err := s.Start("moshi"); err == nil {
+	if err := s.Start("moshi", "linux", "amd64"); err == nil {
 		t.Fatal("should refuse cross-family while worker is up")
 	}
 }
@@ -200,7 +207,7 @@ func TestStart_RejectsCrossFamily(t *testing.T) {
 func TestHandleEvent_ErrorClearsManifest(t *testing.T) {
 	fake := &fakeWorker{}
 	s, _ := newTestService(t, fake)
-	if err := s.Start("moshi"); err != nil {
+	if err := s.Start("moshi", "linux", "amd64"); err != nil {
 		t.Fatal(err)
 	}
 	waitFor(t, "onEvent ready", func() bool {
@@ -229,7 +236,8 @@ func TestDeleteFiles_RemovesCacheAndManifest(t *testing.T) {
 	cacheRoot := t.TempDir()
 	t.Setenv("HUGGINGFACE_HUB_CACHE", cacheRoot)
 
-	entry := models.DefaultMoshiEntry()
+	host, arch := models.HostPlatform()
+	entry := models.DefaultMoshiEntry(host, arch)
 	repoDir := filepath.Join(
 		cacheRoot,
 		"models--"+strings.ReplaceAll(entry.Repo, "/", "--"),

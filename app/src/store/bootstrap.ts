@@ -59,8 +59,13 @@ async function pollOnce() {
   // While any download is active we also re-pull /models on each tick
   // so byte-progress + phase render live. When idle we skip — /models
   // is recomputed from disk every call which is cheap but not free.
-  const { models } = useServerStore.getState();
-  if (models.some((m) => m.download && m.download.phase !== "error")) {
+  // Also re-pull while the remote-platform probe hasn't completed,
+  // so the catalog spinner doesn't sit there past the actual handshake.
+  const { models, catalogLoading } = useServerStore.getState();
+  if (
+    catalogLoading ||
+    models.some((m) => m.download && m.download.phase !== "error")
+  ) {
     await fetchModels();
   }
 }
@@ -72,8 +77,17 @@ async function pollOnce() {
 async function fetchModels() {
   try {
     const res = await fetch(`${SERVER_URL}/models`);
-    const body = (await res.json()) as { models: ModelInfo[] };
-    useServerStore.getState().setModels(body.models ?? []);
+    const body = (await res.json()) as {
+      models: ModelInfo[];
+      loading?: boolean;
+    };
+    // REASON: in remote mode the catalog is empty + loading=true while
+    // the eager handshake probe runs. Stash that flag so the UI can
+    // render a spinner instead of an empty grid that looks broken.
+    useServerStore.getState().setCatalog({
+      models: body.models ?? [],
+      loading: Boolean(body.loading),
+    });
   } catch {
     // Same fallback as /status — stale UI is better than crashing.
   }

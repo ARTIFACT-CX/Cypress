@@ -100,6 +100,27 @@ type Manager struct {
 	// a redial (remote: yes; local subprocess crash: no, surface and
 	// transition to idle).
 	remote *workers.RemoteEndpoint
+
+	// workerPlatform is the snapshot the worker stamped onto its last
+	// gRPC Handshake (OS, arch, available backends, downloaded repos).
+	// Used to pick model variants — without this, an Apple-Silicon
+	// laptop dialing a Linux GPU worker would pick MLX weights the
+	// worker can't load. Refreshed every time we install a new worker
+	// handle.
+	//
+	// Local mode keeps this empty; Platform() falls back to
+	// runtime.GOOS/GOARCH there since the laptop *is* the worker.
+	workerPlatform workers.Platform
+	// platformReady fires once the first remote handshake has populated
+	// workerPlatform. Until then /models returns an empty + loading=true
+	// response so the UI shows a spinner instead of the host's catalog.
+	// Closed exactly once.
+	platformReady     chan struct{}
+	platformReadyOnce sync.Once
+	// downloadedRepos tracks which HF repos the worker reports as fully
+	// cached. Seeded from the handshake snapshot, kept current via
+	// download_done events for the rest of the session. Guarded by mu.
+	downloadedRepos map[string]bool
 }
 
 // Config is the composition-root contract for building a Manager.
@@ -168,13 +189,30 @@ func NewManager(cfg Config) *Manager {
 		}
 	}
 	m := &Manager{
-		state:    StateIdle,
-		envSetup: envSetup,
-		manifest: mf,
-		spawn:    spawn,
-		remote:   cfg.Remote,
+		state:           StateIdle,
+		envSetup:        envSetup,
+		manifest:        mf,
+		spawn:           spawn,
+		remote:          cfg.Remote,
+		platformReady:   make(chan struct{}),
+		downloadedRepos: map[string]bool{},
 	}
 	m.downloads = downloads.New(m, envSetup, mf)
+
+	// REASON: in local mode the worker is the laptop, so the platform
+	// is known synchronously from runtime. Mark ready immediately so
+	// /models doesn't sit in the loading state forever.
+	if cfg.Remote == nil {
+		m.markPlatformReady()
+	} else {
+		// Eager probe: dial the remote worker once at startup, capture
+		// the handshake fields, then disconnect. Subsequent LoadModel
+		// calls open their own handles. This is what makes the catalog
+		// UI render the right variants on first paint instead of after
+		// the user clicks Load. Runs on a goroutine so NewManager stays
+		// non-blocking.
+		go m.probeRemotePlatform()
+	}
 	return m
 }
 
@@ -184,10 +222,14 @@ func NewManager(cfg Config) *Manager {
 // supplies one via setManifest.
 func newManagerWithSpawn(spawn SpawnFn) *Manager {
 	m := &Manager{
-		state: StateIdle,
-		spawn: spawn,
+		state:           StateIdle,
+		spawn:           spawn,
+		platformReady:   make(chan struct{}),
+		downloadedRepos: map[string]bool{},
 	}
 	m.downloads = downloads.New(m, nil, nil)
+	// Tests default to local mode (no remote endpoint set).
+	m.markPlatformReady()
 	return m
 }
 
@@ -208,12 +250,11 @@ func (m *Manager) LoadModel(name string) error {
 	// STEP 0: pre-flight the catalog so we know which family to spawn
 	// (and which venv that selects). Unknown / unavailable models fail
 	// here rather than after we've spawned a worker for nothing.
-	entry := models.EntryByName(name)
-	if entry == nil {
+	// Platform-independent — we only need the family field, which is
+	// the same across variants.
+	family := models.FamilyOf(name)
+	if family == "" {
 		return fmt.Errorf("unknown model %q", name)
-	}
-	if entry.Family == "" {
-		return fmt.Errorf("model %q has no family configured", name)
 	}
 
 	// STEP 1: synchronously advance state under the lock so a /status
@@ -229,10 +270,10 @@ func (m *Manager) LoadModel(name string) error {
 	// coexist in one process. Refuse cross-family loads while a worker
 	// is up and force the user to unload first — Shutdown drops the
 	// subprocess so the next load spawns the right venv.
-	if m.worker != nil && m.workerFamily != "" && m.workerFamily != entry.Family {
+	if m.worker != nil && m.workerFamily != "" && m.workerFamily != family {
 		m.mu.Unlock()
 		return fmt.Errorf("worker is running %q models; unload before loading %q (family %q)",
-			m.workerFamily, name, entry.Family)
+			m.workerFamily, name, family)
 	}
 	// Clear any stale error from a previous failed attempt so the UI
 	// doesn't continue to show it once the user retries.
@@ -250,7 +291,7 @@ func (m *Manager) LoadModel(name string) error {
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), loadTimeout)
 		defer cancel()
-		m.doLoad(ctx, name, entry.Family)
+		m.doLoad(ctx, name, family)
 	}()
 	return nil
 }
@@ -302,6 +343,13 @@ func (m *Manager) doLoad(ctx context.Context, name string, family string) {
 		m.worker = w
 		m.workerFamily = family
 		m.state = StateLoading
+		// Refresh platform snapshot from this handle's handshake. In
+		// local mode the runtime values stay authoritative (recorded
+		// values are unused for variant selection); in remote mode this
+		// catches any cache changes the worker picked up since the
+		// eager probe.
+		m.recordHandshakePlatformLocked(w.Platform())
+		m.markPlatformReady()
 		m.mu.Unlock()
 		go m.watchWorker(w, family)
 	}
@@ -363,6 +411,17 @@ func (m *Manager) handleEvent(msg map[string]any) {
 		// Download lifecycle is owned by the downloads.Service; route
 		// through so its inflight map and manifest writes stay current.
 		m.downloads.HandleEvent(event, msg)
+		// REASON: keep the worker's downloaded-repos snapshot fresh as
+		// installs land. Without this, /models would still show the
+		// model as "Download" after a successful pull until the next
+		// handshake — exactly the regression described in the bug.
+		if event == "download_done" {
+			if repo, ok := msg["repo"].(string); ok && repo != "" {
+				m.mu.Lock()
+				m.downloadedRepos[repo] = true
+				m.mu.Unlock()
+			}
+		}
 	}
 }
 
@@ -452,6 +511,8 @@ func (m *Manager) SpawnWorker(ctx context.Context, family string) (workers.Handl
 	if m.state == StateIdle {
 		m.state = StateReady
 	}
+	m.recordHandshakePlatformLocked(spawned.Platform())
+	m.markPlatformReady()
 	go m.watchWorker(spawned, family)
 	return spawned, nil
 }
@@ -460,15 +521,43 @@ func (m *Manager) SpawnWorker(ctx context.Context, family string) (workers.Handl
 
 // DownloadModel kicks off a download via the downloads service. Thin
 // passthrough kept on Manager so the HTTP handler has one entry point
-// for model lifecycle commands.
-func (m *Manager) DownloadModel(name string) error { return m.downloads.Start(name) }
+// for model lifecycle commands. The repo is selected for the worker's
+// platform — for remote workers the laptop's runtime is the wrong
+// answer (would request MLX weights for a Linux GPU box).
+func (m *Manager) DownloadModel(name string) error {
+	os, arch, ready := m.Platform()
+	if !ready {
+		// REASON: catalog UI shouldn't surface a Download button before
+		// the platform is known, but a CLI / curl could still hit this
+		// — refuse rather than guess wrong.
+		return errors.New("worker platform not yet known; try again in a moment")
+	}
+	return m.downloads.Start(name, os, arch)
+}
 
 // CancelDownload aborts the in-flight pull for name.
 func (m *Manager) CancelDownload(name string) error { return m.downloads.Cancel(name) }
 
-// ModelInfos is the catalog merged with inflight progress. Single
-// entry point for the /models route.
-func (m *Manager) ModelInfos() []models.ModelInfo { return m.downloads.ModelInfos() }
+// ModelInfos is the catalog merged with inflight progress for the
+// worker's platform. Returns nil when the platform isn't known yet
+// (eager remote probe still in flight) so the handler can surface a
+// loading state to the UI.
+func (m *Manager) ModelInfos() []models.ModelInfo {
+	os, arch, ready := m.Platform()
+	if !ready {
+		return nil
+	}
+	return m.downloads.ModelInfos(os, arch, m.DownloadedRepos())
+}
+
+// PlatformReadyForResponse exposes whether the catalog is currently
+// renderable. Used by the /models handler to set a loading flag in
+// the JSON response so the UI can show a spinner instead of an empty
+// list.
+func (m *Manager) PlatformReadyForResponse() bool {
+	_, _, ready := m.Platform()
+	return ready
+}
 
 // DeleteModel removes an installed model from disk and the manifest.
 // Refuses if the model is currently loaded or downloading. After a
@@ -485,12 +574,12 @@ func (m *Manager) DeleteModel(name string) error {
 		return errors.New("download in progress for this model")
 	}
 
-	cat := models.EntryByName(name)
+	family := models.FamilyOf(name)
 	if err := m.downloads.DeleteFiles(name); err != nil {
 		return err
 	}
-	if cat != nil && cat.Family != "" {
-		m.maybeRemoveFamily(cat.Family)
+	if family != "" {
+		m.maybeRemoveFamily(family)
 	}
 	return nil
 }
@@ -556,9 +645,127 @@ func (m *Manager) familyHasInstalled(family string) bool {
 		return false
 	}
 	for _, entry := range m.manifest.All() {
-		if cat := models.EntryByName(entry.Name); cat != nil && cat.Family == family {
+		if models.FamilyOf(entry.Name) == family {
 			return true
 		}
 	}
 	return false
+}
+
+// --- Platform discovery -------------------------------------------------------
+//
+// The Manager exposes the platform that variant selection should target.
+// Local mode: laptop's runtime values. Remote mode: whatever the worker
+// reported on its last Handshake. The /models handler reads this to
+// pick repo + files matched to where the model will actually run.
+
+// Platform returns the (os, arch) tuple variant selection should target,
+// plus whether the worker has been probed yet. Callers that need to
+// render the catalog should consult `ready` first — empty values
+// before the eager probe completes mean "platform unknown, defer."
+func (m *Manager) Platform() (os, arch string, ready bool) {
+	// Fast path: closed channel means probe completed (or local mode).
+	select {
+	case <-m.platformReady:
+	default:
+		return "", "", false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.remote == nil {
+		host, harch := models.HostPlatform()
+		return host, harch, true
+	}
+	return m.workerPlatform.OS, m.workerPlatform.Arch, true
+}
+
+// PlatformReady returns a channel that closes when the platform tuple
+// is available — local mode: at NewManager return; remote mode: after
+// the eager probe handshake. Useful for tests that want to wait
+// deterministically rather than poll.
+func (m *Manager) PlatformReady() <-chan struct{} { return m.platformReady }
+
+// DownloadedRepos returns a copy of the worker-reported set of
+// fully-cached HF repos. Used by ModelInfos to avoid the wrong-side
+// IsRepoCached probe (laptop's cache is empty when the worker is
+// remote). Returns nil before the platform is ready so the caller can
+// fall through to a local probe in local mode.
+func (m *Manager) DownloadedRepos() map[string]bool {
+	select {
+	case <-m.platformReady:
+	default:
+		return nil
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.remote == nil {
+		// Local mode: the worker IS the laptop, so the on-disk probe
+		// in info.go is authoritative. Returning nil opts back into it.
+		return nil
+	}
+	out := make(map[string]bool, len(m.downloadedRepos))
+	for k, v := range m.downloadedRepos {
+		out[k] = v
+	}
+	return out
+}
+
+// markPlatformReady closes platformReady exactly once. Idempotent so
+// either the eager probe path or a concurrent watcher refresh can call
+// it without a panic on double-close.
+func (m *Manager) markPlatformReady() {
+	m.platformReadyOnce.Do(func() { close(m.platformReady) })
+}
+
+// recordHandshakePlatform stores the platform snapshot from a freshly
+// installed worker handle. Called by every site that installs a new
+// `m.worker`: doLoad, SpawnWorker, watchWorker (post-redial), and the
+// eager probe. Must be called with m.mu held.
+func (m *Manager) recordHandshakePlatformLocked(p workers.Platform) {
+	m.workerPlatform = p
+	// Reset and reseed the downloaded-repos set from the handshake.
+	// REASON: the worker is the source of truth on every reconnect; if
+	// its cache changed (volume swap, manual delete) we want to honor
+	// the new reality, not stale state from a prior session.
+	m.downloadedRepos = make(map[string]bool, len(p.DownloadedRepos))
+	for _, repo := range p.DownloadedRepos {
+		m.downloadedRepos[repo] = true
+	}
+}
+
+// probeRemotePlatform dials the remote worker once at startup, captures
+// the handshake fields, and disconnects. Runs on a goroutine kicked
+// off by NewManager — failures here aren't fatal (the user might not
+// have started the remote worker yet); markPlatformReady still fires
+// so /models can return its empty/loading response definitively rather
+// than spinning forever. The next LoadModel will dial again and
+// refresh the snapshot.
+func (m *Manager) probeRemotePlatform() {
+	// REASON: scope the dial deadline tightly. The eager probe is
+	// best-effort; if the remote isn't reachable yet we'd rather mark
+	// ready quickly so the UI can render *something*.
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+
+	// Family arg is ignored by the remote spawn closure — see NewManager.
+	w, err := m.spawn(ctx, "")
+	if err != nil {
+		log.Printf("remote platform probe failed: %v (catalog will populate after first load)", err)
+		m.markPlatformReady()
+		return
+	}
+	plat := w.Platform()
+
+	m.mu.Lock()
+	m.recordHandshakePlatformLocked(plat)
+	m.mu.Unlock()
+	m.markPlatformReady()
+
+	// SAFETY: Disconnect, not Stop. The probe's job is "open a session,
+	// read the handshake, hang up." Stop sends a shutdown RPC that
+	// kills the Python process — the next LoadModel / Download dial
+	// would then get a connection-reset because there's no listener
+	// left. Disconnect closes only the gRPC channel; the worker stays
+	// up to serve subsequent dials.
+	_ = w.Disconnect()
 }

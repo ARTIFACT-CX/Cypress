@@ -782,12 +782,23 @@ func (*ServerMsg_Event) isServerMsg_Payload() {}
 // the host can distinguish "worker is ready" from "stream opened but
 // worker still importing torch." If startup fails, the server may
 // instead send Handshake{ready=false, fatal=...} and close the stream.
+//
+// os/arch/available_backends/downloaded_repos let the host pick model
+// variants (MLX vs torch, quantization, repo) that match the worker's
+// actual platform — without these, an Apple-Silicon laptop dialing a
+// Linux GPU worker would tell it to download MLX weights it can't run.
+// downloaded_repos is a snapshot taken when the worker boots; the host
+// keeps it current via download_done events for that session.
 type Handshake struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Ready         bool                   `protobuf:"varint,1,opt,name=ready,proto3" json:"ready,omitempty"`
-	Fatal         *string                `protobuf:"bytes,2,opt,name=fatal,proto3,oneof" json:"fatal,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	Ready             bool                   `protobuf:"varint,1,opt,name=ready,proto3" json:"ready,omitempty"`
+	Fatal             *string                `protobuf:"bytes,2,opt,name=fatal,proto3,oneof" json:"fatal,omitempty"`
+	Os                string                 `protobuf:"bytes,3,opt,name=os,proto3" json:"os,omitempty"`                                                        // "linux" | "darwin" | "windows"
+	Arch              string                 `protobuf:"bytes,4,opt,name=arch,proto3" json:"arch,omitempty"`                                                    // "amd64" | "arm64"
+	AvailableBackends []string               `protobuf:"bytes,5,rep,name=available_backends,json=availableBackends,proto3" json:"available_backends,omitempty"` // ["torch"] | ["mlx", "torch"]
+	DownloadedRepos   []string               `protobuf:"bytes,6,rep,name=downloaded_repos,json=downloadedRepos,proto3" json:"downloaded_repos,omitempty"`       // HF repo IDs already cached
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
 }
 
 func (x *Handshake) Reset() {
@@ -832,6 +843,34 @@ func (x *Handshake) GetFatal() string {
 		return *x.Fatal
 	}
 	return ""
+}
+
+func (x *Handshake) GetOs() string {
+	if x != nil {
+		return x.Os
+	}
+	return ""
+}
+
+func (x *Handshake) GetArch() string {
+	if x != nil {
+		return x.Arch
+	}
+	return ""
+}
+
+func (x *Handshake) GetAvailableBackends() []string {
+	if x != nil {
+		return x.AvailableBackends
+	}
+	return nil
+}
+
+func (x *Handshake) GetDownloadedRepos() []string {
+	if x != nil {
+		return x.DownloadedRepos
+	}
+	return nil
 }
 
 type Reply struct {
@@ -1835,10 +1874,14 @@ const file_worker_proto_rawDesc = "" +
 	"\thandshake\x18\x01 \x01(\v2\x1c.cypress.worker.v1.HandshakeH\x00R\thandshake\x120\n" +
 	"\x05reply\x18\x02 \x01(\v2\x18.cypress.worker.v1.ReplyH\x00R\x05reply\x120\n" +
 	"\x05event\x18\x03 \x01(\v2\x18.cypress.worker.v1.EventH\x00R\x05eventB\t\n" +
-	"\apayload\"F\n" +
+	"\apayload\"\xc4\x01\n" +
 	"\tHandshake\x12\x14\n" +
 	"\x05ready\x18\x01 \x01(\bR\x05ready\x12\x19\n" +
-	"\x05fatal\x18\x02 \x01(\tH\x00R\x05fatal\x88\x01\x01B\b\n" +
+	"\x05fatal\x18\x02 \x01(\tH\x00R\x05fatal\x88\x01\x01\x12\x0e\n" +
+	"\x02os\x18\x03 \x01(\tR\x02os\x12\x12\n" +
+	"\x04arch\x18\x04 \x01(\tR\x04arch\x12-\n" +
+	"\x12available_backends\x18\x05 \x03(\tR\x11availableBackends\x12)\n" +
+	"\x10downloaded_repos\x18\x06 \x03(\tR\x0fdownloadedReposB\b\n" +
 	"\x06_fatal\"\xc9\x03\n" +
 	"\x05Reply\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\x04R\x02id\x12,\n" +

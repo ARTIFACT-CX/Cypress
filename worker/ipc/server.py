@@ -203,9 +203,21 @@ class WorkerServicer(pb_grpc.WorkerServicer):
     shutdown event the composition root waits on so it can stop the
     gRPC server cleanly when a client sends a shutdown command."""
 
-    def __init__(self, registry: ModelRegistry, shutdown_event: asyncio.Event):
+    def __init__(
+        self,
+        registry: ModelRegistry,
+        shutdown_event: asyncio.Event,
+        platform_info: dict | None = None,
+    ):
         self._registry = registry
         self._shutdown = shutdown_event
+        # SETUP: platform snapshot is built once at boot by the
+        # composition root and passed in here so every Handshake we
+        # emit carries the same view. None means "boot didn't gather
+        # one" (legacy callers / tests) — the handshake will go out
+        # with empty platform fields, which the Go side treats as
+        # "platform unknown, assume linux/amd64 default."
+        self._platform_info = platform_info or {}
 
     async def Session(self, request_iterator, context):
         # Per-session outbox merges replies and events into the single
@@ -225,8 +237,20 @@ class WorkerServicer(pb_grpc.WorkerServicer):
         commands.configure(_on_event, self._registry)
 
         # First message after stream open per the proto contract — the
-        # Go host won't dispatch any commands until it sees this.
-        yield pb.ServerMsg(handshake=pb.Handshake(ready=True))
+        # Go host won't dispatch any commands until it sees this. The
+        # platform snapshot piggybacks on the same message so the host
+        # knows what variants this worker can actually run before it
+        # even shows the catalog UI. Defaults via .get() keep older
+        # WorkerServicer constructions (no platform_info) wire-valid.
+        yield pb.ServerMsg(
+            handshake=pb.Handshake(
+                ready=True,
+                os=self._platform_info.get("os", ""),
+                arch=self._platform_info.get("arch", ""),
+                available_backends=self._platform_info.get("available_backends", []),
+                downloaded_repos=self._platform_info.get("downloaded_repos", []),
+            )
+        )
 
         async def _consume():
             # One ClientMsg at a time keeps reply ordering tied to send
@@ -304,6 +328,7 @@ async def serve(
     *,
     token: str | None = None,
     tls: tuple[bytes, bytes] | None = None,
+    platform_info: dict | None = None,
 ) -> None:
     """Boot the gRPC server, bind the listen target, and block until a
     client requests shutdown. `listen` is one of:
@@ -337,7 +362,7 @@ async def serve(
         interceptors.append(AuthInterceptor(token))
     server = grpc.aio.server(interceptors=interceptors)
     pb_grpc.add_WorkerServicer_to_server(
-        WorkerServicer(registry, shutdown_event), server
+        WorkerServicer(registry, shutdown_event, platform_info), server
     )
 
     if tls is not None:

@@ -84,8 +84,13 @@ func New(provider WorkerProvider, envSetup *workers.EnvSetup, manifest *models.M
 // Start kicks off (or rejects) a model download. Returns synchronously
 // after the inflight slot is reserved; the IPC and worker setup run on
 // a background goroutine so the HTTP handler returns fast.
-func (s *Service) Start(name string) error {
-	entry := models.EntryByName(name)
+//
+// os/arch select which platform-specific variant to download — for
+// remote workers the caller passes the worker's reported platform, not
+// the laptop's, so the worker doesn't end up with weights it can't
+// load.
+func (s *Service) Start(name, targetOS, targetArch string) error {
+	entry := models.EntryFor(name, targetOS, targetArch)
 	if entry == nil {
 		return fmt.Errorf("unknown model %q", name)
 	}
@@ -274,7 +279,12 @@ func (s *Service) DeleteFiles(name string) error {
 	if s.manifest != nil {
 		entry = s.manifest.Get(name)
 	}
-	cat := models.EntryByName(name)
+	// REASON: cache cleanup uses the host's platform as a best-effort
+	// fallback when the manifest doesn't have a recorded repo. Almost
+	// always overridden by the manifest entry below, which holds the
+	// repo that was actually downloaded regardless of platform.
+	host, arch := models.HostPlatform()
+	cat := models.EntryFor(name, host, arch)
 
 	// STEP 1: nuke the HF cache directory for this repo. Removing the
 	// snapshot tree alone would leave orphaned blobs; HF's loader is
@@ -322,7 +332,7 @@ func (s *Service) FamilyHasInflight(family string) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for name := range s.inflight {
-		if cat := models.EntryByName(name); cat != nil && cat.Family == family {
+		if models.FamilyOf(name) == family {
 			return true
 		}
 	}
@@ -342,9 +352,11 @@ func (s *Service) Inflight() map[string]*models.DownloadProgress {
 	return out
 }
 
-// ModelInfos returns the catalog merged with current inflight progress.
-// Single entry point for the /models route so the handler doesn't
-// reach into Service internals.
-func (s *Service) ModelInfos() []models.ModelInfo {
-	return models.ModelInfos(s.Inflight())
+// ModelInfos returns the catalog merged with current inflight progress
+// for the target platform. downloadedRepos is the authoritative cache
+// snapshot from the worker (nil to fall back to a local-disk probe;
+// only correct in local-subprocess mode). Single entry point for the
+// /models route so the handler doesn't reach into Service internals.
+func (s *Service) ModelInfos(targetOS, targetArch string, downloadedRepos map[string]bool) []models.ModelInfo {
+	return models.ModelInfos(targetOS, targetArch, downloadedRepos, s.Inflight())
 }

@@ -7,6 +7,12 @@
 // runs on demand). The trade-off is that the two sides need to stay
 // in sync; there's exactly one knob today (CYPRESS_MOSHI_REPO) and we
 // document the linkage in comments.
+//
+// All variant-selection functions take an explicit (os, arch) tuple
+// so the caller can choose between the laptop's platform (local
+// worker mode) and the remote worker's reported platform (remote
+// mode). Without that split, an Apple-Silicon laptop dialing a Linux
+// GPU worker would tell it to download MLX weights it can't load.
 
 package models
 
@@ -34,6 +40,15 @@ type Entry struct {
 	Family string
 }
 
+// HostPlatform returns the laptop's (GOOS, GOARCH). Use this only when
+// the caller is genuinely running against a local worker, OR for
+// family-only lookups where the repo/files fields are immaterial.
+// Platform-sensitive paths (downloads, /models) should pass the
+// worker's reported tuple instead.
+func HostPlatform() (os, arch string) {
+	return runtime.GOOS, runtime.GOARCH
+}
+
 // REASON: backend selection mirrors worker/models/__init__.py's
 // _default_moshi_backend. We can't import that logic, so we duplicate
 // the platform check; if the worker logic ever grows more complex
@@ -50,11 +65,12 @@ const (
 	moshiMlxQ8LMFile   = "model.q8.safetensors"
 )
 
-// DefaultMoshiEntry returns the platform-appropriate Moshi entry. Exported
-// so tests can assert on the same repo string the catalog uses without
-// duplicating the runtime check.
-func DefaultMoshiEntry() Entry {
-	if runtime.GOOS == "darwin" && runtime.GOARCH == "arm64" {
+// DefaultMoshiEntry returns the Moshi entry for the given target
+// platform. Apple Silicon → MLX-q8 (only place where the bf16-MPS path
+// is too slow to be usable in practice); everything else → torch-bf16.
+// The model itself is the same 3.5B Moshi regardless of variant.
+func DefaultMoshiEntry(os, arch string) Entry {
+	if os == "darwin" && arch == "arm64" {
 		return Entry{
 			Name:         "moshi",
 			Label:        "Moshi",
@@ -82,13 +98,13 @@ func DefaultMoshiEntry() Entry {
 	}
 }
 
-// Catalog returns the static set; Available reflects whether the worker
-// has a registered loader. PersonaPlex is listed so users see what's
-// coming but can't click it yet — the moment its loader lands in the
-// worker we just flip Available.
-func Catalog() []Entry {
+// Catalog returns the static set for a target platform. Available
+// reflects whether the worker has a registered loader. PersonaPlex is
+// listed so users see what's coming but can't click it yet — the
+// moment its loader lands in the worker we just flip Available.
+func Catalog(os, arch string) []Entry {
 	return []Entry{
-		DefaultMoshiEntry(),
+		DefaultMoshiEntry(os, arch),
 		{
 			Name:    "personaplex",
 			Label:   "PersonaPlex",
@@ -111,12 +127,12 @@ func Catalog() []Entry {
 	}
 }
 
-// EntryByName returns the static entry for a given model name, or nil.
-// Used by callers that need the repo / files / family for a model name
-// (downloads.Service when starting a pull, inference.Manager when
-// picking the venv to spawn).
-func EntryByName(name string) *Entry {
-	for _, e := range Catalog() {
+// EntryFor returns the static entry for a given model name on the
+// target platform, or nil. Used by callers that need the platform-
+// specific repo / files (downloads.Service when starting a pull,
+// inference.Manager when picking the venv to spawn).
+func EntryFor(name, os, arch string) *Entry {
+	for _, e := range Catalog(os, arch) {
 		if e.Name == name {
 			cp := e
 			return &cp
@@ -126,9 +142,12 @@ func EntryByName(name string) *Entry {
 }
 
 // FamilyOf returns the per-family venv key for a model name, or "" if
-// unknown. Convenience for callers that only care about the family.
+// unknown. Family is platform-independent — every variant of moshi
+// belongs to the "moshi" family — so callers that only care about
+// family don't need a platform tuple.
 func FamilyOf(name string) string {
-	if e := EntryByName(name); e != nil {
+	host, arch := HostPlatform()
+	if e := EntryFor(name, host, arch); e != nil {
 		return e.Family
 	}
 	return ""

@@ -302,6 +302,7 @@ export function ModelPicker() {
   const cancelDownload = useServerStore((s) => s.cancelDownload);
   const deleteModel = useServerStore((s) => s.deleteModel);
   const models = useServerStore((s) => s.models);
+  const catalogLoading = useServerStore((s) => s.catalogLoading);
 
   // Local: surfaced action error. Cleared when the next action starts.
   const [error, setError] = useState<string | null>(null);
@@ -410,9 +411,13 @@ export function ModelPicker() {
       <div className="flex flex-col gap-1.5">
         {models.length === 0 && serverUp && (
           // REASON: catalog hasn't landed yet — first /models fetch is
-          // in flight. Render a quiet placeholder rather than nothing
-          // so the section doesn't visibly snap in.
-          <div className="text-muted-foreground italic">Loading catalog…</div>
+          // in flight, OR the server is in remote mode and the eager
+          // platform probe is still running. Distinguish so the user
+          // knows whether to expect a worker handshake (the slower
+          // case) or just a millisecond.
+          <div className="text-muted-foreground italic">
+            {catalogLoading ? "Probing remote worker…" : "Loading catalog…"}
+          </div>
         )}
         {models.map((m) => {
           const isActive =

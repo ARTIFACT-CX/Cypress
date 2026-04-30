@@ -137,6 +137,11 @@ func (m *Manager) watchWorker(w workers.Handle, family string) {
 	if priorState == StateServing || priorState == StateLoading {
 		m.lastError = "remote worker reconnected; reload model to resume"
 	}
+	// REASON: a reconnect is a fresh handshake, so the worker may have
+	// picked up new cache entries (or lost some) since we last looked.
+	// Refresh the platform/downloaded snapshot to keep variant selection
+	// honest.
+	m.recordHandshakePlatformLocked(fresh.Platform())
 	m.mu.Unlock()
 
 	// Install a watcher on the new handle so the next drop gets the

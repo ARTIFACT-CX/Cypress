@@ -75,6 +75,10 @@ import ipc
 # import the one this process is running — see models.load_family.
 import models
 
+# REASON: platform_info is a pure-stdlib helper (no model deps); safe
+# to import unconditionally before load_family runs.
+import platform_info as worker_platform_info
+
 
 def _default_listen() -> str:
     # SETUP: derive a per-pid unix socket path so multiple workers can
@@ -88,6 +92,7 @@ async def _run(
     listen: str,
     token: str | None,
     tls: tuple[bytes, bytes] | None,
+    platform_info: dict | None = None,
 ) -> None:
     # Cleanup the unix socket on exit so we don't leave stale files in
     # /tmp for the next run. TCP listeners self-clean.
@@ -101,7 +106,13 @@ async def _run(
             pass
 
     try:
-        await ipc.serve(listen, models.REGISTRY, token=token, tls=tls)
+        await ipc.serve(
+            listen,
+            models.REGISTRY,
+            token=token,
+            tls=tls,
+            platform_info=platform_info,
+        )
     finally:
         if sock_path is not None:
             try:
@@ -185,8 +196,13 @@ def main() -> None:
             f"{family} venv built? ({e})"
         ) from e
 
+    # SETUP: snapshot platform + cache state once, after load_family
+    # so the backend probe sees whatever the family installed in this
+    # venv. Cheap (a few sys-syscall stats); doesn't grow with cache size.
+    info = worker_platform_info.gather(family)
+
     try:
-        asyncio.run(_run(listen, token, tls))
+        asyncio.run(_run(listen, token, tls, info))
     except KeyboardInterrupt:
         # Ctrl-C from a manual run is not an error; exit cleanly.
         pass

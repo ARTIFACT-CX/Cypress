@@ -114,6 +114,28 @@ func (f *fakeWorker) Done() <-chan struct{} {
 	return f.doneCh
 }
 
+// Platform returns an empty snapshot — Manager tests construct the
+// Manager via newManagerWithSpawn (local mode), so platform falls
+// back to runtime values; the fake's reported platform is unused.
+func (f *fakeWorker) Platform() workers.Platform { return workers.Platform{} }
+
+// Disconnect mirrors the real handle's "drop the channel without
+// sending shutdown" path. For the in-memory fake this is just like
+// Stop — closing doneCh so the watcher exits — except we don't bump
+// the stopErr/stopFn machinery, since callers (the eager probe) don't
+// expect the fake to behave as if a real teardown happened.
+func (f *fakeWorker) Disconnect() error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.doneInitLocked()
+	select {
+	case <-f.doneCh:
+	default:
+		close(f.doneCh)
+	}
+	return nil
+}
+
 // waitForState polls Status until it matches `want` or the deadline elapses.
 // Used because LoadModel is fire-and-forget — doLoad runs on a goroutine so
 // the test must wait for it to land in the terminal state.

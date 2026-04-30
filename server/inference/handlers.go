@@ -13,6 +13,8 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+
+	"github.com/ARTIFACT-CX/cypress/server/models"
 )
 
 // RegisterRoutes attaches the inference HTTP routes onto the given mux.
@@ -26,11 +28,26 @@ func RegisterRoutes(mux *http.ServeMux, mgr *Manager) {
 	})
 
 	mux.HandleFunc("/models", func(w http.ResponseWriter, _ *http.Request) {
-		// Static catalog + a per-call HF cache probe + any inflight
-		// downloads. Cheap (a few stat()s + a map snapshot) so we
-		// recompute per request rather than caching. The UI polls
-		// this for live download progress.
-		writeJSON(w, http.StatusOK, map[string]any{"models": mgr.ModelInfos()})
+		// Static catalog + the worker's reported cache snapshot + any
+		// inflight downloads. Cheap (a map snapshot) so we recompute
+		// per request rather than caching. The UI polls this for live
+		// download progress.
+		//
+		// `loading` is true while the eager remote-platform probe is
+		// still running — `models` is empty during that window so the
+		// UI can show a spinner instead of the host's catalog (which
+		// could mismatch the remote worker's variants). Local mode
+		// flips to ready synchronously, so `loading` is never true
+		// there.
+		infos := mgr.ModelInfos()
+		ready := mgr.PlatformReadyForResponse()
+		if infos == nil {
+			infos = []models.ModelInfo{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"models":  infos,
+			"loading": !ready,
+		})
 	})
 
 	// REASON: scope download under the model's own path so the URL
