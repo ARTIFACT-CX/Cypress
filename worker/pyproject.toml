@@ -12,7 +12,7 @@
 name = "cypress-worker"
 version = "0.1.0"
 description = "Shared worker scaffold for Cypress (no model deps)"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 # REASON: empty by design. Model deps belong in the per-family pyproject
 # (e.g. worker/models/moshi/pyproject.toml). The unit suite fakes
 # huggingface_hub via sys.modules monkeypatch, so we don't need it here.

@@ -14,7 +14,7 @@
 name = "cypress-worker-moshi"
 version = "0.1.0"
 description = "Moshi family model deps for Cypress worker"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<3.14"
 dependencies = [
     # moshi ships its own torch pin; we let it drive the torch version so
     # checkpoint format and op coverage stay aligned with what kyutai tests.
