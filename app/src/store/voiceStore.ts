@@ -62,12 +62,18 @@ type VoiceStore = {
   activeTurn: Turn | null;
   micLevel: number;
   playbackLevel: number;
+  // Soft-mute toggle. While true the session keeps the WS + playback
+  // open and the model keeps generating, but mic frames stop shipping.
+  // Cleared every time start() runs so a fresh session always begins
+  // unmuted regardless of how the previous one ended.
+  muted: boolean;
 
   // Actions. Called from buttons / effects; lifecycle of the
   // underlying VoiceSession is managed inside.
   start: () => Promise<void>;
   stop: () => Promise<void>;
   toggle: () => Promise<void>;
+  toggleMute: () => void;
 };
 
 // SAFETY: module-level singleton. The session owns a WS, a mic, and
@@ -219,16 +225,20 @@ export const useVoiceStore = create<VoiceStore>((set, get) => {
     activeTurn: null,
     micLevel: 0,
     playbackLevel: 0,
+    muted: false,
 
     start: async () => {
       // Wipe transcript history when explicitly starting a fresh
       // conversation. Stopping leaves history visible so the user
-      // can read what was said after they tap to end.
-      set({ error: null, turns: [], activeTurn: null });
+      // can read what was said after they tap to end. Also reset the
+      // mute flag — sessions always begin hot.
+      set({ error: null, turns: [], activeTurn: null, muted: false });
       lastUserActivityAt = 0;
       lastAgentTextAt = 0;
+      const s = ensureSession();
+      s.setMuted(false);
       try {
-        await ensureSession().start();
+        await s.start();
       } catch {
         // setState already fired error via onState callback.
       }
@@ -244,6 +254,14 @@ export const useVoiceStore = create<VoiceStore>((set, get) => {
         // Re-enter via start() so error/transcript wipes happen.
         await get().start();
       }
+    },
+    toggleMute: () => {
+      const next = !get().muted;
+      set({ muted: next });
+      // Mirror to the imperative session so the mic loop sees it on
+      // the next frame. No-op if the session hasn't been built yet —
+      // start() will read the store's `muted` and re-apply.
+      session?.setMuted(next);
     },
   };
 });

@@ -60,11 +60,24 @@ export class VoiceSession {
   // time here so successive frames play seamlessly without overlap or gap.
   private playCursor = 0;
   private state: SessionState = "idle";
+  // Soft mute. Drops outgoing mic frames while keeping the WS open and
+  // the playback path running, so the model keeps streaming and the
+  // session resumes instantly on unmute. Default false; the store
+  // mirror flips it via setMuted().
+  private muted = false;
 
   constructor(private events: VoiceSessionEvents = {}) {}
 
   getState(): SessionState {
     return this.state;
+  }
+
+  // Toggle the soft-mute gate. Cheap — the next mic frame just drops
+  // instead of being shipped over the WS. Safe to call any time;
+  // before the session is live it just stages the value for when the
+  // mic loop starts.
+  setMuted(muted: boolean): void {
+    this.muted = muted;
   }
 
   async start(): Promise<void> {
@@ -199,6 +212,19 @@ export class VoiceSession {
   private onMicFrame(e: AudioProcessingEvent) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) return;
     const ch = e.inputBuffer.getChannelData(0);
+    // REASON: when muted, ship a silence frame instead of dropping. Moshi
+    // is full-duplex in lockstep — it generates one output frame for
+    // every input frame, so if we stop sending entirely the worker has
+    // nothing to process and pauses output too. Sending zeros keeps the
+    // stream synchronized while still gating the user's actual audio.
+    // Emit a zero level so the turn-detection heuristic in voiceStore
+    // doesn't open "user" turns based on activity the worker never saw.
+    if (this.muted) {
+      const silence = new Int16Array(ch.length); // zeroed by default
+      this.ws.send(silence.buffer);
+      this.events.onMicLevel?.(0);
+      return;
+    }
     const int16 = new Int16Array(ch.length);
     let sumSq = 0;
     for (let i = 0; i < ch.length; i++) {

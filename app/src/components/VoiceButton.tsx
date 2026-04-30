@@ -15,7 +15,15 @@
 // are open; tap again to end the conversation.
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronUp, Loader2, Mic, MicOff } from "lucide-react";
+import {
+  ChevronDown,
+  ChevronUp,
+  Loader2,
+  Mic,
+  MicOff,
+  Volume2,
+  VolumeX,
+} from "lucide-react";
 import { selectIsModelReady, useServerStore } from "../store/serverStore";
 import { useVoiceStore, type Turn } from "../store/voiceStore";
 import { cn } from "../lib/utils";
@@ -95,6 +103,8 @@ export function VoiceButton() {
   const turns = useVoiceStore((s) => s.turns);
   const activeTurn = useVoiceStore((s) => s.activeTurn);
   const toggle = useVoiceStore((s) => s.toggle);
+  const muted = useVoiceStore((s) => s.muted);
+  const toggleMute = useVoiceStore((s) => s.toggleMute);
 
   // Visibility gate. modelReady covers both "Tauri server running"
   // and "Go-side model loaded with no error" — see selectIsModelReady.
@@ -116,6 +126,23 @@ export function VoiceButton() {
 
   const live = state === "live";
   const busy = state === "connecting" || state === "closing";
+
+  // Keyboard shortcut: `m` toggles mute while a session is live. Skip
+  // when focus is in a text input so the user can still type the
+  // letter normally — same pattern most desktop apps follow.
+  useEffect(() => {
+    if (!live) return;
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== "m" && e.key !== "M") return;
+      const target = e.target as HTMLElement | null;
+      if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
+      if (target?.isContentEditable) return;
+      e.preventDefault();
+      toggleMute();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [live, toggleMute]);
 
   // Tick a "now" value once a second while a turn is active so the
   // user-turn duration counter ("Speaking… 0:07") advances without
@@ -207,15 +234,46 @@ export function VoiceButton() {
 
       <div className="pointer-events-none fixed inset-x-0 bottom-6 flex flex-col items-center gap-3">
       {/* Status / error caption. min-h reserves a row so the button
-          doesn't jump when the caption appears/disappears. */}
+          doesn't jump when the caption appears/disappears. Muted
+          state piggybacks on this row so the user always has a visible
+          confirmation that mic is off. */}
       <div className="min-h-[1rem] text-center text-[10px] text-muted-foreground">
-        {error ? <span className="text-red-400">{error}</span> : label}
+        {error ? (
+          <span className="text-red-400">{error}</span>
+        ) : live && muted ? (
+          <span className="text-amber-400">Muted · press M to unmute</span>
+        ) : (
+          label
+        )}
       </div>
 
-      {/* Button. The audio-reactive visual lives on the logo (see
-          useChromaticAberration in App), so this stays a calm static
-          control — no competing pulse here. */}
-      <div className="pointer-events-auto relative flex h-14 w-14 items-center justify-center">
+      {/* Button row. Mute toggle sits to the left of the main button,
+          only mounted while live so the idle UI stays uncluttered.
+          The audio-reactive visual lives on the logo (see
+          useChromaticAberration in App), so the buttons themselves
+          stay calm — no competing pulse here. */}
+      <div className="pointer-events-auto relative flex items-center gap-3">
+        {live && (
+          <button
+            type="button"
+            onClick={toggleMute}
+            aria-pressed={muted}
+            aria-label={muted ? "Unmute (M)" : "Mute (M)"}
+            title={muted ? "Unmute (M)" : "Mute (M)"}
+            className={cn(
+              "flex h-10 w-10 items-center justify-center rounded-full border shadow-sm transition-colors",
+              muted
+                ? "border-amber-400/60 bg-amber-500/20 text-amber-100 hover:bg-amber-500/30"
+                : "border-border bg-card text-foreground hover:bg-accent",
+            )}
+          >
+            {muted ? (
+              <VolumeX className="h-4 w-4" />
+            ) : (
+              <Volume2 className="h-4 w-4" />
+            )}
+          </button>
+        )}
         <button
           type="button"
           onClick={toggle}
